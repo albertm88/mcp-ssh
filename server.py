@@ -42,7 +42,7 @@ _DANGEROUS_COMMANDS = re.compile(
 )
 # 命令注入特征检测（排除合法的 && || 管道操作，只检测恶意特征）
 _INJECTION_PATTERNS = re.compile(
-    r";\s*(rm|wget|curl|nc|ncat|bash|sh|chmod|chown|passwd|useradd)|`[^`]+`|\$\([^)]+\)|>\s*/dev/(tcp|udp)|<\s*\(|wget\s+https?://.*\|\s*(sh|bash)|curl\s+https?://.*\|\s*(sh|bash)|nc\s+.*-e|ncat\s+.*-e|\|\s*(sh|bash|zsh|python|perl)\s*$",
+    r";\s*(rm|wget|curl|nc|ncat|bash|sh|chmod|chown|passwd|useradd)|/dev/(tcp|udp)/|wget\s+https?://.*\|\s*(sh|bash)|curl\s+https?://.*\|\s*(sh|bash)|nc\s+.*-e|ncat\s+.*-e|\|\s*(sh|bash|zsh|python|perl)\s*$",
     re.IGNORECASE
 )
 # 敏感文件路径保护
