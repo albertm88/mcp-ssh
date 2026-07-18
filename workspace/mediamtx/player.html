@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>机器狗视频流播放</title>
+    <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; color: #4CAF50; }
+        .player-container { background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 20px; }
+        video { width: 100%; display: block; background: #000; }
+        .controls { padding: 15px; background: #2d2d2d; border-radius: 8px; }
+        .protocol-select { margin-bottom: 15px; }
+        select, button { padding: 8px 16px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+        select { background: #3d3d3d; color: #fff; margin-right: 10px; }
+        button { background: #4CAF50; color: #fff; }
+        button:hover { background: #45a049; }
+        .status { margin-top: 10px; padding: 10px; border-radius: 4px; font-size: 14px; }
+        .status.connected { background: rgba(76, 175, 80, 0.2); color: #4CAF50; }
+        .status.disconnected { background: rgba(244, 67, 54, 0.2); color: #f44336; }
+        .info { margin-top: 20px; padding: 15px; background: #2d2d2d; border-radius: 8px; font-size: 14px; line-height: 1.6; }
+        .info code { background: #3d3d3d; padding: 2px 6px; border-radius: 3px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐕 绝影Lite3 视频流监控</h1>
+        
+        <div class="player-container">
+            <video id="video" controls autoplay muted playsinline></video>
+        </div>
+
+        <div class="controls">
+            <div class="protocol-select">
+                <select id="protocol">
+                    <option value="webrtc">WebRTC (超低延迟 <300ms)</option>
+                    <option value="flv">HTTP-FLV (低延迟 1-3s)</option>
+                    <option value="hls">HLS (兼容性好 3-10s)</option>
+                </select>
+                <button onclick="startPlay()">开始播放</button>
+                <button onclick="stopPlay()">停止</button>
+            </div>
+            <div id="status" class="status disconnected">未连接</div>
+        </div>
+
+        <div class="info">
+            <h3>📡 流地址说明</h3>
+            <p><strong>服务器地址：</strong><code>14.103.43.192</code></p>
+            <p><strong>WebRTC：</strong><code>http://14.103.43.192:8889/dog</code>（推荐用于远程操控）</p>
+            <p><strong>HTTP-FLV：</strong><code>http://14.103.43.192:8888/dog.flv</code></p>
+            <p><strong>HLS：</strong><code>http://14.103.43.192:8888/dog/index.m3u8</code></p>
+            <p><strong>RTSP：</strong><code>rtsp://14.103.43.192:8554/dog</code>（专业播放器使用）</p>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        const protocolSelect = document.getElementById('protocol');
+        let flvPlayer = null;
+        let hlsPlayer = null;
+        let webrtcPc = null;
+
+        function setStatus(text, connected) {
+            statusEl.textContent = text;
+            statusEl.className = `status ${connected ? 'connected' : 'disconnected'}`;
+        }
+
+        function stopPlay() {
+            if (flvPlayer) { flvPlayer.destroy(); flvPlayer = null; }
+            if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+            if (webrtcPc) { webrtcPc.close(); webrtcPc = null; }
+            video.srcObject = null;
+            video.src = '';
+            setStatus('已停止', false);
+        }
+
+        async function startPlay() {
+            stopPlay();
+            const protocol = protocolSelect.value;
+            const server = '14.103.43.192';
+            const streamPath = '/dog';
+
+            try {
+                if (protocol === 'webrtc') {
+                    // WebRTC 播放
+                    setStatus('正在连接WebRTC...', false);
+                    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+                    webrtcPc = pc;
+                    
+                    pc.ontrack = e => { video.srcObject = e.streams[0]; };
+                    pc.onconnectionstatechange = () => {
+                        if (pc.connectionState === 'connected') setStatus('✅ WebRTC已连接 (延迟<300ms)', true);
+                        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') setStatus('❌ 连接断开', false);
+                    };
+
+                    pc.addTransceiver('video', { direction: 'recvonly' });
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+
+                    const res = await fetch(`http://${server}:8889${streamPath}/whep`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/sdp' },
+                        body: offer.sdp
+                    });
+                    const answerSdp = await res.text();
+                    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                } 
+                else if (protocol === 'flv') {
+                    // FLV 播放
+                    setStatus('正在连接FLV...', false);
+                    const url = `http://${server}:8888${streamPath}.flv`;
+                    if (flvjs.isSupported()) {
+                        flvPlayer = flvjs.createPlayer({ type: 'flv', url, isLive: true });
+                        flvPlayer.attachMediaElement(video);
+                        flvPlayer.load();
+                        flvPlayer.play();
+                        setStatus('✅ FLV已连接 (延迟1-3s)', true);
+                    } else {
+                        setStatus('❌ 浏览器不支持FLV', false);
+                    }
+                } 
+                else if (protocol === 'hls') {
+                    // HLS 播放
+                    setStatus('正在连接HLS...', false);
+                    const url = `http://${server}:8888${streamPath}/index.m3u8`;
+                    if (Hls.isSupported()) {
+                        hlsPlayer = new Hls();
+                        hlsPlayer.loadSource(url);
+                        hlsPlayer.attachMedia(video);
+                        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+                            video.play();
+                            setStatus('✅ HLS已连接 (延迟3-10s)', true);
+                        });
+                    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                        video.src = url;
+                        video.play();
+                        setStatus('✅ HLS已连接 (延迟3-10s)', true);
+                    } else {
+                        setStatus('❌ 浏览器不支持HLS', false);
+                    }
+                }
+            } catch (e) {
+                setStatus(`❌ 连接失败：${e.message}`, false);
+                console.error(e);
+            }
+        }
+
+        // 自动尝试WebRTC播放
+        window.onload = startPlay;
+    </script>
+</body>
+</html>

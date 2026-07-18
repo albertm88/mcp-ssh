@@ -1,0 +1,10 @@
+[project]
+name = "mcp-ssh"
+version = "0.2.0"
+description = "SSH control + Notion MCP server; reuses local ~/.ssh/config, cross-platform, supports key + password auth, file transfer, and Notion API integration"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "paramiko>=3.4.0",
+    "charset-normalizer>=3.3.0",
+]

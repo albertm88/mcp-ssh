@@ -1,0 +1,39 @@
+# MediaMTX 配置文件 - 机器狗RTSP流媒体服务
+# 端口配置
+rtspAddress: :8554
+rtmpAddress: :1935
+hlsAddress: :8888
+webrtcAddress: :8889
+apiAddress: :9997
+
+# 认证配置（默认关闭，后续可按需开启）
+authMethod: none
+# authInternalUsers:
+#   - user: admin
+#     pass: your_password
+#     permissions:
+#       - action: publish
+#       - action: read
+
+# 路径配置
+paths:
+  # 机器狗RTSP拉流配置（后续替换为实际RTSP地址）
+  dog:
+    source: rtsp://localhost:8554/stream  # 后续替换为机器狗实际RTSP地址，例如 rtsp://机器狗IP:8554/live
+    sourceProtocol: tcp
+    sourceOnDemand: false
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
+    # 自动重连
+    sourceReconnect: true
+    sourceReconnectPause: 2s
+    # 录像配置
+    record: true
+    recordPath: /opt/mediamtx-recordings/%Y-%m-%d_%H-%M-%S-%f.mp4
+    recordFormat: mp4
+    recordPartDuration: 1h
+    recordSegmentDuration: 10m
+    recordDeleteAfter: 720h  # 保存30天
+  # 支持其他路径动态推/拉流
+  all:
+    source: publisher
