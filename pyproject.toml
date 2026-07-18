@@ -1,8 +1,9 @@
 [project]
 name = "mcp-ssh"
 version = "0.2.0"
-description = "SSH control + Notion MCP server; reuses local ~/.ssh/config, cross-platform, supports key + password auth, file transfer, and Notion API integration"
+description = "Lightweight cross-platform SSH MCP server; reuses local ~/.ssh/config, supports key + password auth, file transfer, and network scanning"
 requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
 dependencies = [
     "mcp>=1.2.0",
     "paramiko>=3.4.0",

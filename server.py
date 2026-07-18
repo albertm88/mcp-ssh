@@ -24,13 +24,9 @@ from mcp.server.fastmcp import FastMCP
 from paramiko import SSHConfig
 
 from logger import get_logger
-from notion_tools import register as _register_notion
 
 mcp = FastMCP("ssh")
 _log = get_logger()
-
-# 注册 Notion 工具组（凭据来自环境变量 NOTION_TOKEN）
-_register_notion(mcp)
 
 # 跨平台 SSH 目录适配
 if platform.system() == "Windows":
@@ -180,7 +176,7 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
 
 def _decode_output(raw: bytes) -> str:
     """自动检测输出编码，解决跨平台/跨语言编码错乱问题。
-    优先尝试 UTF-8，失败则用 charset-normalizer 自动识别，兜底 GBK/CP936（Windows 中文）。
+    优先尝试 UTF-8，然后尝试中文编码，最后用 charset-normalizer 自动识别。
     """
     if not raw:
         return ""
@@ -189,6 +185,12 @@ def _decode_output(raw: bytes) -> str:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         pass
+    # 优先尝试常用中文编码（避免 charset-normalizer 误判）
+    for enc in ("gbk", "cp936", "gb2312", "big5"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
     # 自动检测编码
     try:
         result = from_bytes(raw).best()
@@ -196,8 +198,8 @@ def _decode_output(raw: bytes) -> str:
             return str(result)
     except Exception:
         pass
-    # 兜底：Windows 中文常用编码
-    for enc in ("gbk", "cp936", "gb2312", "big5", "latin-1"):
+    # 最终兜底
+    for enc in ("latin-1",):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
