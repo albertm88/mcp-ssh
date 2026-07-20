@@ -24,9 +24,11 @@ from mcp.server.fastmcp import FastMCP
 from paramiko import SSHConfig
 
 from logger import get_logger
+from review import ReviewContext, ReviewMode, get_review_engine
 
 mcp = FastMCP("ssh")
 _log = get_logger()
+_review_engine = get_review_engine()
 
 # 跨平台 SSH 目录适配
 if platform.system() == "Windows":
@@ -239,62 +241,74 @@ def _read_channel(channel: paramiko.Channel, timeout: float) -> str:
     return _decode_output(b"".join(chunks))
 
 
-def _validate_command(command: str, allow_dangerous: bool = False) -> None:
-    """命令安全校验：检测注入特征、危险命令、敏感文件访问，防止命令混淆/误操作/数据泄露。"""
+def _validate_command(command: str, allow_dangerous: bool = False, host: str = "", tool: str = "ssh_exec") -> None:
+    """命令安全校验：委托审核引擎进行多模式审核。"""
     if not command.strip():
         raise ValueError("命令不能为空")
-    
+
     # 命令长度限制，防止超长命令攻击
     if len(command) > 10000:
         _log.warning("command_too_long", length=len(command))
         raise RuntimeError("命令长度超过限制（最大10000字符）")
-    
-    # 检测敏感文件访问（防止密钥/密码泄露）
-    if not allow_dangerous and _SENSITIVE_PATHS.search(command):
-        _log.warning("sensitive_path_access_detected", command=command[:200])
-        raise RuntimeError(
-            "检测到敏感文件访问（/etc/passwd、/etc/shadow、SSH密钥等），已拦截执行。"
-            "确认要访问请设置 allow_dangerous=True 参数。"
-        )
-    
-    # 检测命令注入特征
-    if _INJECTION_PATTERNS.search(command):
-        _log.warning("command_injection_detected", command=command[:200])
-        raise RuntimeError(
-            "检测到潜在命令注入特征（反弹shell、远程脚本执行、未授权命令拼接等），已拦截执行。"
-            "如需执行包含特殊字符的命令，请显式说明用途并设置 allow_dangerous=True。"
-        )
-    
-    # 检测高危系统命令
-    if not allow_dangerous and _DANGEROUS_COMMANDS.search(command):
-        _log.warning("dangerous_command_detected", command=command[:200])
-        raise RuntimeError(
-            f"检测到高危命令（可能导致系统损坏/数据丢失/服务中断）：{command[:50]}...，"
-            "确认要执行请设置 allow_dangerous=True 参数。"
-        )
-    
-    # 审计日志：记录所有执行的命令
-    _log.debug("command_validated", command=command[:500], allow_dangerous=allow_dangerous)
+
+    # 委托审核引擎
+    ctx = ReviewContext(
+        tool=tool,
+        command=command,
+        host=host,
+        allow_dangerous=allow_dangerous,
+    )
+    result = _review_engine.review(ctx)
+
+    if not result.approved:
+        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+
+    _log.debug("command_validated", command=command[:500], mode=result.mode, risk=result.risk_level)
 
 
 def _normalize_command(command: str, shell: Optional[str] = None) -> str:
     """跨平台命令标准化：自动适配不同系统的 shell 和换行符。
-    注意：默认不添加本地shell前缀，远程服务器默认使用用户默认shell（通常是bash/sh）。
+
+    安全原则：
+      - 默认不添加本地 shell 前缀，远程使用用户默认 shell
+      - 显式指定 shell 时，使用 shlex.quote 防止注入
+      - Windows 命令自动检测仅基于明确特征，避免误判
     """
-    # 统一换行符为 LF
+    # 统一换行符为 LF（防止 CRLF 导致远程执行失败）
     command = command.replace("\r\n", "\n").replace("\r", "\n")
-    # 只有显式指定shell或者明确是Windows命令时才添加前缀
+
     if shell is not None:
-        if shell.lower() in ("cmd", "cmd.exe"):
+        shell_lower = shell.lower()
+        if shell_lower in ("cmd", "cmd.exe"):
+            # Windows CMD：直接传递，不额外转义（CMD 无标准转义机制）
             command = f"cmd /c {command}"
-        elif shell.lower() in ("powershell", "pwsh", "ps"):
-            command = f"powershell -NoProfile -Command \"{command.replace('`', '``').replace('"', '`"')}\""
-        elif shell.lower() in ("bash", "sh", "zsh"):
+        elif shell_lower in ("powershell", "pwsh", "ps"):
+            # PowerShell：使用 -EncodedCommand 避免引号嵌套地狱
+            import base64
+            encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+            command = f"powershell -NoProfile -EncodedCommand {encoded}"
+        elif shell_lower in ("bash", "sh", "zsh"):
+            # POSIX shell：使用 shlex.quote 安全转义
             command = f"{shell} -c {shlex.quote(command)}"
+        else:
+            # 未知 shell：记录日志并原样传递
+            _log.warning("unknown_shell", shell=shell, command=command[:100])
     else:
-        # 仅当明确检测到Windows命令时才添加cmd前缀，避免误判远程Linux命令
-        if all(cmd in command.lower() for cmd in ("dir ", "\\")) or any(cmd in command.lower() for cmd in ("ipconfig", "netstat -an", "tasklist")):
+        # 仅在明确检测到 Windows 命令特征时才添加 cmd 前缀
+        # 使用更精确的特征匹配，避免误判
+        cmd_lower = command.lower()
+        is_windows_cmd = (
+            # 明确的 Windows 命令
+            any(cmd_lower.startswith(p) for p in ("ipconfig", "netstat", "tasklist", "systeminfo", "ver", "vol"))
+            # dir 命令 + 反斜杠路径（强 Windows 特征）
+            or ("dir " in cmd_lower and "\\" in command)
+            # 纯 Windows 路径格式
+            or (len(command) > 2 and command[1] == ":" and command[2] == "\\")
+        )
+        if is_windows_cmd:
             command = f"cmd /c {command}"
+            _log.debug("windows_cmd_detected", original=command[:100])
+
     return command
 
 
@@ -320,8 +334,8 @@ def ssh_exec(
     Returns:
         包含 exit_code / stdout / stderr 的文本，自动适配编码避免乱码。
     """
-    # 安全校验
-    _validate_command(command, allow_dangerous=allow_dangerous)
+    # 安全校验（委托审核引擎）
+    _validate_command(command, allow_dangerous=allow_dangerous, host=host, tool="ssh_exec")
     # 命令标准化和跨平台适配
     command = _normalize_command(command, shell=shell)
     # 处理环境变量
@@ -509,7 +523,20 @@ def ssh_upload(host: str, local_path: str, remote_path: str, timeout: int = 60, 
     size = local.stat().st_size
     if size > 100 * 1024 * 1024:  # 100MB
         raise RuntimeError(f"文件大小超过限制（最大100MB，当前{round(size/1024/1024, 2)}MB）")
-    # 敏感路径保护
+
+    # 审核引擎校验
+    ctx = ReviewContext(
+        tool="ssh_upload",
+        command=f"upload {local_path} -> {remote_path}",
+        host=host,
+        path=remote_path,
+        allow_dangerous=overwrite,
+    )
+    result = _review_engine.review(ctx)
+    if not result.approved:
+        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+
+    # 敏感路径保护（保留原有逻辑作为兜底）
     if not overwrite and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("upload_to_sensitive_path", remote_path=remote_path)
         raise RuntimeError(f"禁止上传到敏感路径：{remote_path}，如需覆盖请设置 overwrite=True")
@@ -538,7 +565,19 @@ def ssh_download(host: str, remote_path: str, local_path: str, timeout: int = 60
         timeout: 传输超时秒数，默认 60。
         allow_sensitive: 是否允许下载敏感文件（/etc/shadow、SSH密钥等），默认 False。
     """
-    # 敏感文件保护
+    # 审核引擎校验
+    ctx = ReviewContext(
+        tool="ssh_download",
+        command=f"download {remote_path} -> {local_path}",
+        host=host,
+        path=remote_path,
+        allow_dangerous=allow_sensitive,
+    )
+    result = _review_engine.review(ctx)
+    if not result.approved:
+        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+
+    # 敏感文件保护（保留原有逻辑作为兜底）
     if not allow_sensitive and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("download_sensitive_file", remote_path=remote_path)
         raise RuntimeError(f"禁止下载敏感文件：{remote_path}，确认需要请设置 allow_sensitive=True")
@@ -702,6 +741,19 @@ def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: in
         recursive: 是否递归删除目录（类似 rm -rf），默认 False。
         timeout: 命令超时秒数，默认 30。
     """
+    # 审核引擎校验
+    ctx = ReviewContext(
+        tool="ssh_remove",
+        command=f"remove {remote_path} (recursive={recursive})",
+        host=host,
+        path=remote_path,
+        allow_dangerous=recursive,
+    )
+    result = _review_engine.review(ctx)
+    if not result.approved:
+        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+
+    # 敏感路径保护（保留原有逻辑作为兜底）
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("remove_sensitive_path", path=remote_path)
         raise RuntimeError(f"禁止删除敏感路径：{remote_path}")
@@ -836,6 +888,50 @@ def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive
         return f"✅ 目录下载成功：{host}:{remote_dir} → {local_dir}\n📊 下载文件：{downloaded} 个，总大小：{round(total_size/1024/1024, 2)}MB，耗时：{round(elapsed, 2)}s"
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# 审核模式管理工具
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def ssh_get_review_mode() -> str:
+    """获取当前审核模式及状态信息。
+
+    Returns:
+        当前审核模式、白名单文件路径、人工确认超时等状态。
+    """
+    status = _review_engine.get_status()
+    lines = [
+        f"🔒 审核模式: {status['mode']}",
+        f"📋 白名单文件: {status['whitelist_file']}",
+        f"   文件存在: {'是' if status['whitelist_exists'] else '否（使用内置默认规则）'}",
+        f"⏱️  人工确认超时: {status['manual_timeout']}s",
+        "",
+        "可选模式:",
+        "  off       - 关闭审核，所有操作直接放行（仅记日志）",
+        "  whitelist - 白名单审核，仅允许匹配规则的命令（默认）",
+        "  manual    - 人工审核，每条命令需人工确认",
+        "  smart     - 智能审核，本地规则初筛，不确定时转人工",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def ssh_set_review_mode(mode: str) -> str:
+    """动态切换审核模式。
+
+    Args:
+        mode: 审核模式，可选: off, whitelist, manual, smart
+
+    Returns:
+        切换结果提示。
+    """
+    success, message = _review_engine.set_mode(mode)
+    if success:
+        return f"✅ {message}"
+    else:
+        return f"❌ {message}"
 
 
 def main() -> None:

@@ -1,0 +1,9 @@
+[mcp_servers.ssh]
+command = "uv"
+args = [
+    "run",
+    "--directory",
+    "D:/mcp-ssh",
+    "python",
+    "server.py",
+]
