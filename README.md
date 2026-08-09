@@ -2,6 +2,10 @@
 
 **轻量级跨平台 SSH MCP 服务器** — 让 AI 助手安全地管理远程服务器。
 
+> **版本**：**1.0.0 正式版**（2026-08-09）。原 `Ver.1.0.0` 为 demo 标记，现已在 `0e149a9` 基线之上完成交付并正式发布。
+>
+> **平台支持**：支持 **Windows** 与 **Linux**（含 WSL2）。**macOS 为不支持平台**——相关安装/配置命令仅供 Linux 参考，不做验证承诺。
+
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
@@ -141,6 +145,58 @@ $env:SSH_PASS_MYSERVER = "your-password"
 > - `myserver` → `SSH_PASS_MYSERVER`
 > - `prod-web` → `SSH_PASS_PROD_WEB`
 > - `192.168.1.100` → `SSH_PASS_192_168_1_100`
+
+---
+
+#### 4.4 严格主机密钥校验（host key，默认开启）
+
+本工具**默认拒绝未知主机密钥**（`RejectPolicy`），不再自动接受任何指纹。首次连接前必须显式信任目标主机：
+
+```bash
+# 将目标主机指纹加入系统 known_hosts（标准 SSH 方式）
+ssh-keyscan -H myserver >> ~/.ssh/known_hosts
+
+# 或通过 ~/.ssh/config 的 StrictHostKeyChecking 首次连接确认
+ssh -o StrictHostKeyChecking=accept-new myserver true
+```
+
+如需使用独立受控 known_hosts 文件（推荐用于 CI / 服务端）：
+
+```bash
+# 生成受控文件并加入目标指纹
+ssh-keyscan -H myserver > /path/to/controlled-known_hosts
+export SSH_KNOWN_HOSTS="/path/to/controlled-known_hosts"
+```
+
+> **安全边界**：
+> - 未知或错误指纹在认证前失败关闭，返回 `HOST_KEY_MISMATCH`，不产生任何远程副作用。
+> - 没有可信 known_hosts 来源时同样失败关闭，禁止自动接受未知密钥。
+> - 错误返回只含 host/port/安全指纹，不包含密码、私钥内容或环境变量值。
+
+---
+
+#### 4.5 结果契约（统一 envelope）
+
+所有工具返回统一结果 envelope（结构化 JSON，含人类可读 `text` 字段）。自动化调用方应只依赖 `status` / `error.code` / `error.retryable` 判断业务状态，不要解析展示文本：
+
+```json
+{
+  "schema_version": "1.0",
+  "request_id": "…",
+  "ok": true,
+  "tool": "ssh_exec",
+  "host": "myserver",
+  "status": "succeeded",
+  "duration_ms": 123,
+  "review": {"mode": "whitelist", "decision": "approved"},
+  "data": {"exit_code": 0, "stdout": "…", "stderr": ""},
+  "warnings": [],
+  "error": null,
+  "text": "[exit_code] 0\n[stdout] …"
+}
+```
+
+稳定状态：`succeeded` / `failed` / `rejected` / `timed_out` / `cancelled` / `partial`。稳定错误码见 `docs/requirements-1.0.md` §4。
 
 ---
 

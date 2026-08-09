@@ -1,21 +1,24 @@
-"""SSH control MCP server.
+﻿"""SSH control MCP server.
 
 复用本地 ~/.ssh/config 的主机别名与凭据；密钥优先，密码兜底。
 密码通过环境变量 SSH_PASS_<HOST> 提供（点/横线转下划线，全大写），
 或 SSH_PASS 作为全局兜底。密钥不会落配置文件。
 
-跨平台支持：Windows/Linux/macOS，自动适配编码、路径、shell 差异。
-安全防护：命令注入检测、危险命令拦截、输出编码自动识别。
+跨平台支持：Windows/Linux，自动适配编码、路径、shell 差异。
+安全防护：命令注入检测、危险命令拦截、输出编码自动识别、严格 host-key。
 """
 from __future__ import annotations
 
+import functools
 import os
+import hashlib
 import pathlib
 import platform
 import re
 import shlex
 import socket
 import time
+import uuid
 from typing import Optional
 
 import paramiko
@@ -23,8 +26,35 @@ from charset_normalizer import from_bytes
 from mcp.server.fastmcp import FastMCP
 from paramiko import SSHConfig
 
+from host_keys import (
+    HostKeyError,
+    apply_host_key_policy,
+    host_key_mismatch_message,
+    is_host_key_failure,
+)
 from logger import get_logger
-from review import ReviewContext, ReviewMode, get_review_engine
+from results import (
+    ERROR_AUTH_FAILED,
+    ERROR_CHECKSUM_MISMATCH,
+    ERROR_CONNECTION_LOST,
+    ERROR_CONNECT_TIMEOUT,
+    ERROR_EXEC_TIMEOUT,
+    ERROR_HOST_KEY_MISMATCH,
+    ERROR_INVALID_ARGUMENT,
+    ERROR_LOCAL_IO_ERROR,
+    ERROR_OUTPUT_LIMIT,
+    ERROR_REMOTE_EXIT_NONZERO,
+    ERROR_REMOTE_IO_ERROR,
+    ERROR_RESOURCE_LIMIT,
+    STATUS_FAILED,
+    STATUS_PARTIAL,
+    STATUS_SUCCEEDED,
+    STATUS_TIMED_OUT,
+    make_failure,
+    make_rejected,
+    make_success,
+)
+from review import ReviewContext, ReviewResult, build_environment_plan, get_review_engine
 
 mcp = FastMCP("ssh")
 _log = get_logger()
@@ -40,18 +70,168 @@ _DEFAULT_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa")
 # 危险命令拦截列表（防止误操作）
 _DANGEROUS_COMMANDS = re.compile(
     r"^\s*(rm\s+(-rf?|--recursive)\s+/(?!tmp|var/tmp)|mkfs|dd\s+if=|format\s+[a-z]:|shutdown|reboot|halt|poweroff|:(){ :|:& };:|fork\s*bomb)",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 # 命令注入特征检测（排除合法的 && || 管道操作，只检测恶意特征）
 _INJECTION_PATTERNS = re.compile(
     r";\s*(rm|wget|curl|nc|ncat|bash|sh|chmod|chown|passwd|useradd)|/dev/(tcp|udp)/|wget\s+https?://.*\|\s*(sh|bash)|curl\s+https?://.*\|\s*(sh|bash)|nc\s+.*-e|ncat\s+.*-e|\|\s*(sh|bash|zsh|python|perl)\s*$",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 # 敏感文件路径保护
 _SENSITIVE_PATHS = re.compile(
     r"/etc/(passwd|shadow|ssh/sshd_config|sudoers)|/root/\.ssh/|~/.ssh/id_",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# 资源限制（off 模式也不能关闭）
+# ---------------------------------------------------------------------------
+
+_MAX_SINGLE_FILE_BYTES = 100 * 1024 * 1024  # 100 MiB
+_MAX_DIR_FILES = 2000
+_MAX_DIR_BYTES = 1024 * 1024 * 1024  # 1 GiB
+_MAX_RECURSE_DEPTH = 32
+_MAX_SCAN_ADDRESSES = 4096
+_MAX_OUTPUT_BYTES = 1024 * 1024  # 1 MiB
+
+
+class ResourceLimitError(Exception):
+    """请求超过配置的资源上限，连接前失败关闭。"""
+
+
+class ChecksumMismatchError(Exception):
+    """传输校验失败（字节数或 SHA-256 不一致）。"""
+
+
+class ReviewRejectedError(Exception):
+    """审核拒绝，不执行任何 SSH/SFTP 副作用。"""
+
+
+def _review_summary(result: ReviewResult) -> dict:
+    return {
+        "mode": result.mode,
+        "decision": "approved" if result.approved else "rejected",
+        "risk": result.risk_level,
+        "reason": result.reason,
+        "plan_id": result.plan_id,
+    }
+
+
+def _sha256_stream(fileobj) -> str:
+    """流式计算 SHA-256，峰值内存 O(chunk)。"""
+    h = hashlib.sha256()
+    while True:
+        chunk = fileobj.read(1 << 16)
+        if not chunk:
+            break
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_local(path: pathlib.Path) -> str:
+    with path.open("rb") as f:
+        return _sha256_stream(f)
+
+
+def _sha256_remote(sftp, remote: str) -> str:
+    with sftp.open(remote, "rb") as f:
+        return _sha256_stream(f)
+
+
+def _reject_remote_traversal(remote_path: str) -> None:
+    """拒绝包含 . / .. 路径组件的远端路径（Review 敏感路径绕过修复）。
+
+    基于原始字符串按 / 拆分判断，避免 PurePosixPath 先规范化掉 "."
+    导致 /etc/./shadow 这类绕过被漏检。在连接前失败关闭。
+    """
+    components = [c for c in remote_path.split("/") if c]
+    if any(c in (".", "..") for c in components):
+        raise ValueError(f"远端路径包含不受支持的 . / .. 组件：{remote_path}")
+
+
+def _connect_failure_envelope(
+    e: Exception, tool: str, host: str, review: dict | None = None,
+) -> dict:
+    """把 _connect 抛出的 HostKeyError / RuntimeError 映射为稳定错误 envelope。"""
+    if isinstance(e, HostKeyError):
+        return make_failure(
+            ERROR_HOST_KEY_MISMATCH, str(e), tool=tool, host=host,
+            review=review,
+        ).to_dict()
+    message = str(e)
+    if "认证失败" in message:
+        code = ERROR_AUTH_FAILED
+    elif "身份文件不存在" in message:
+        code = ERROR_INVALID_ARGUMENT
+    elif "连接超时" in message or "timeout" in message.lower():
+        code = ERROR_CONNECT_TIMEOUT
+    else:
+        code = ERROR_CONNECTION_LOST
+    return make_failure(
+        code, message, tool=tool, host=host, review=review,
+    ).to_dict()
+
+
+def _tool_boundary(tool_name: str):
+    """行为边界钩子：统一把工具抛出的未捕获异常映射为稳定错误 envelope。
+
+    保证所有 MCP 工具 100% 返回 ResultEnvelope——即使某个工具内部遗漏了
+    某个错误分支，也不会以裸异常逃逸出 MCP 边界。由 functools.wraps 保留
+    原函数签名与 FastMCP schema。
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = time.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            except ReviewRejectedError as e:
+                return make_rejected(str(e), tool=tool_name).to_dict()
+            except HostKeyError as e:
+                _log.error("tool_boundary_host_key", tool=tool_name, error=str(e))
+                return _connect_failure_envelope(e, tool_name, "", review=None)
+            except ResourceLimitError as e:
+                _log.error("tool_boundary_resource_limit", tool=tool_name, error=str(e))
+                return make_failure(
+                    ERROR_RESOURCE_LIMIT, str(e), tool=tool_name,
+                ).to_dict()
+            except ChecksumMismatchError as e:
+                _log.error("tool_boundary_checksum", tool=tool_name, error=str(e))
+                return make_failure(
+                    ERROR_CHECKSUM_MISMATCH, str(e), tool=tool_name,
+                ).to_dict()
+            except TimeoutError as e:
+                _log.error("tool_boundary_timeout", tool=tool_name, error=str(e))
+                return make_failure(
+                    ERROR_EXEC_TIMEOUT, str(e), tool=tool_name,
+                    status=STATUS_TIMED_OUT,
+                ).to_dict()
+            except paramiko.AuthenticationException as e:
+                _log.error("tool_boundary_auth", tool=tool_name, error=str(e))
+                return make_failure(
+                    ERROR_AUTH_FAILED, str(e), tool=tool_name,
+                ).to_dict()
+            except (socket.timeout, OSError) as e:
+                _log.error("tool_boundary_io", tool=tool_name, error=str(e))
+                return make_failure(
+                    ERROR_CONNECTION_LOST, str(e), tool=tool_name,
+                ).to_dict()
+            except RuntimeError as e:
+                _log.error("tool_boundary_runtime", tool=tool_name, error=str(e))
+                return _connect_failure_envelope(e, tool_name, "", review=None)
+            except Exception as e:
+                _log.error(
+                    "tool_boundary_unhandled", tool=tool_name,
+                    error=str(e), elapsed=round(time.monotonic() - t0, 3),
+                )
+                return make_failure(
+                    ERROR_REMOTE_IO_ERROR, str(e), tool=tool_name,
+                ).to_dict()
+
+        return wrapper
+
+    return decorator
 
 
 def _load_ssh_config() -> SSHConfig:
@@ -89,7 +269,6 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(min(timeout, 5.0))
     try:
-        # Windows 下 socket 连接错误码映射
         sock.connect((hostname, port))
         _log.debug("tcp_probe_ok", host=host, hostname=hostname, port=port)
     except socket.timeout:
@@ -100,7 +279,6 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
         )
     except OSError as e:
         err_msg = str(e)
-        # 跨平台错误码适配
         if e.errno in (10060, 10061, 110, 111, 60, 61):
             err_type = "连接被拒绝" if e.errno in (10061, 111, 61) else "连接超时"
             _log.warning("tcp_probe_refused", host=host, hostname=hostname, port=port, error=err_msg, errno=e.errno)
@@ -117,7 +295,12 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
         sock.close()
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # 严格 host-key 策略：未知/错误指纹在认证前失败关闭（Review P1 #2）
+    try:
+        apply_host_key_policy(client, hostname, port)
+    except RuntimeError as e:
+        _log.error("ssh_host_key_mismatch", host=host, hostname=hostname, port=port, error=str(e))
+        raise HostKeyError(str(e), hostname=hostname, port=port) from e
 
     # 1) 密钥：config 里的 IdentityFile + 默认密钥 + ssh-agent
     identity_files: list[str] = []
@@ -128,6 +311,14 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
         p = _SSH_DIR / name
         if p.exists() and str(p) not in identity_files:
             identity_files.append(str(p))
+
+    # 显式配置的身份文件缺失：在认证前给出明确诊断，不裸抛 FileNotFoundError
+    for key_path in identity_files:
+        if not pathlib.Path(key_path).expanduser().exists():
+            raise RuntimeError(
+                f"SSH 身份文件不存在：{key_path}。请检查 ~/.ssh/config 的 "
+                f"IdentityFile 或使用默认密钥（~/.ssh/id_ed25519 等）。"
+            )
 
     last_err: Exception | None = None
     for key_path in identity_files:
@@ -140,7 +331,19 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
             _log.info("ssh_connected", host=host, hostname=hostname, port=port,
                        username=username, auth="key", key=os.path.basename(key_path))
             return client
+        except paramiko.BadHostKeyException as e:
+            _log.error("ssh_host_key_mismatch", host=host, hostname=hostname, port=port, error=str(e))
+            raise HostKeyError(
+                host_key_mismatch_message(hostname, port, e),
+                hostname=hostname, port=port,
+            ) from e
         except paramiko.SSHException as e:
+            if is_host_key_failure(e):
+                _log.error("ssh_host_key_mismatch", host=host, hostname=hostname, port=port, error=str(e))
+                raise HostKeyError(
+                    host_key_mismatch_message(hostname, port, e),
+                    hostname=hostname, port=port,
+                ) from e
             _log.debug("key_auth_failed", host=host, key=os.path.basename(key_path), error=str(e))
             last_err = e
             continue
@@ -157,14 +360,26 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
             _log.info("ssh_connected", host=host, hostname=hostname, port=port,
                        username=username, auth="password")
             return client
-        except paramiko.AuthenticationException:
-            _log.warning("auth_failed", host=host, hostname=hostname, port=port,
-                          username=username, reason="bad_password")
-            raise RuntimeError(
-                f"认证失败：{username}@{hostname}:{port} — 密码错误。"
-                f"请检查环境变量 SSH_PASS_{host.upper().replace('.', '_').replace('-', '_')}。"
-            )
+        except paramiko.BadHostKeyException as e:
+            _log.error("ssh_host_key_mismatch", host=host, hostname=hostname, port=port, error=str(e))
+            raise HostKeyError(
+                host_key_mismatch_message(hostname, port, e),
+                hostname=hostname, port=port,
+            ) from e
         except paramiko.SSHException as e:
+            if is_host_key_failure(e):
+                _log.error("ssh_host_key_mismatch", host=host, hostname=hostname, port=port, error=str(e))
+                raise HostKeyError(
+                    host_key_mismatch_message(hostname, port, e),
+                    hostname=hostname, port=port,
+                ) from e
+            if isinstance(e, paramiko.AuthenticationException):
+                _log.warning("auth_failed", host=host, hostname=hostname, port=port,
+                              username=username, reason="bad_password")
+                raise RuntimeError(
+                    f"认证失败：{username}@{hostname}:{port} — 密码错误。"
+                    f"请检查环境变量 SSH_PASS_{host.upper().replace('.', '_').replace('-', '_')}。"
+                )
             _log.debug("password_auth_error", host=host, error=str(e))
             last_err = e
 
@@ -177,188 +392,462 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
 
 
 def _decode_output(raw: bytes) -> str:
-    """自动检测输出编码，解决跨平台/跨语言编码错乱问题。
-    优先尝试 UTF-8，然后尝试中文编码，最后用 charset-normalizer 自动识别。
-    """
+    """自动检测输出编码，解决跨平台/跨语言编码错乱问题。"""
     if not raw:
         return ""
-    # 优先尝试 UTF-8
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         pass
-    # 优先尝试常用中文编码（避免 charset-normalizer 误判）
     for enc in ("gbk", "cp936", "gb2312", "big5"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    # 自动检测编码
     try:
         result = from_bytes(raw).best()
         if result:
             return str(result)
     except Exception:
         pass
-    # 最终兜底
-    for enc in ("latin-1",):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    # 最终兜底：替换错误字符
     return raw.decode("utf-8", errors="replace")
 
 
-def _read_channel(channel: paramiko.Channel, timeout: float) -> str:
-    """分块读取 channel 输出，使用 channel 级超时避免 PipeTimeout。
-    跨平台优化：适配不同系统的输出缓冲行为。
+def _read_channel(channel: paramiko.Channel, deadline: float) -> dict:
+    """Read channel output until exit or an absolute monotonic deadline.
+
+    Returns {"text": str, "truncated": bool}. Output is capped at
+    _MAX_OUTPUT_BYTES; beyond that the text is truncated and truncated=True
+    (quota is enforced in every review mode).
     """
-    channel.settimeout(timeout)
     chunks: list[bytes] = []
-    deadline = time.monotonic() + timeout
-    # Windows 系统下增加初始等待时间，避免输出不完整
-    if platform.system() == "Windows":
-        time.sleep(0.05)
+    total = 0
+    truncated = False
+
+    def _append(data: bytes) -> None:
+        nonlocal total, truncated
+        if truncated:
+            return
+        remaining = _MAX_OUTPUT_BYTES - total
+        if len(data) > remaining:
+            if remaining > 0:
+                chunks.append(data[:remaining])
+            total = _MAX_OUTPUT_BYTES
+            truncated = True
+        else:
+            chunks.append(data)
+            total += len(data)
+
     while not channel.exit_status_ready():
         if channel.recv_ready():
-            chunks.append(channel.recv(65536))
+            _append(channel.recv(65536))
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                break
-            time.sleep(0.05)
-    # 收尾：读取剩余数据，最多等待 2 秒确保输出完整
-    end_wait = time.monotonic() + 2.0
-    while time.monotonic() < end_wait:
-        if channel.recv_ready():
-            chunks.append(channel.recv(65536))
-            end_wait = time.monotonic() + 0.2  # 有新数据就延长等待
-        else:
-            if channel.exit_status_ready():
-                break
-            time.sleep(0.05)
-    return _decode_output(b"".join(chunks))
+                raise TimeoutError("远程命令执行超过 timeout deadline")
+            channel.settimeout(min(remaining, 0.2))
+            time.sleep(min(remaining, 0.05))
+    while channel.recv_ready():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("远程命令输出收尾超过 timeout deadline")
+        _append(channel.recv(65536))
+    return {"text": _decode_output(b"".join(chunks)), "truncated": truncated}
 
 
-def _validate_command(command: str, allow_dangerous: bool = False, host: str = "", tool: str = "ssh_exec") -> None:
+def _review_context(ctx: ReviewContext) -> ReviewResult:
+    """Review the exact operation context before any remote side effect."""
+    result = _review_engine.review(ctx)
+    if not result.approved:
+        raise ReviewRejectedError(f"审核拒绝 [{result.mode}]: {result.reason}")
+    return result
+
+
+def _validate_command(
+    command: str,
+    allow_dangerous: bool = False,
+    host: str = "",
+    tool: str = "ssh_exec",
+    shell: Optional[str] = None,
+    environment: Optional[dict[str, str]] = None,
+) -> tuple[ReviewContext, ReviewResult]:
     """命令安全校验：委托审核引擎进行多模式审核。"""
     if not command.strip():
         raise ValueError("命令不能为空")
 
-    # 命令长度限制，防止超长命令攻击
     if len(command) > 10000:
         _log.warning("command_too_long", length=len(command))
         raise RuntimeError("命令长度超过限制（最大10000字符）")
 
-    # 委托审核引擎
+    _, environment_names, environment_digest = build_environment_plan(environment)
     ctx = ReviewContext(
         tool=tool,
         command=command,
         host=host,
         allow_dangerous=allow_dangerous,
+        shell=shell,
+        environment=environment_names,
+        environment_digest=environment_digest,
     )
-    result = _review_engine.review(ctx)
-
-    if not result.approved:
-        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
-
-    _log.debug("command_validated", command=command[:500], mode=result.mode, risk=result.risk_level)
+    result = _review_context(ctx)
+    _log.debug("command_validated", command=command[:500], mode=_review_engine.get_mode())
+    return ctx, result
 
 
 def _normalize_command(command: str, shell: Optional[str] = None) -> str:
-    """跨平台命令标准化：自动适配不同系统的 shell 和换行符。
-
-    安全原则：
-      - 默认不添加本地 shell 前缀，远程使用用户默认 shell
-      - 显式指定 shell 时，使用 shlex.quote 防止注入
-      - Windows 命令自动检测仅基于明确特征，避免误判
-    """
-    # 统一换行符为 LF（防止 CRLF 导致远程执行失败）
+    """跨平台命令标准化：自动适配不同系统的 shell 和换行符。"""
     command = command.replace("\r\n", "\n").replace("\r", "\n")
 
     if shell is not None:
         shell_lower = shell.lower()
         if shell_lower in ("cmd", "cmd.exe"):
-            # Windows CMD：直接传递，不额外转义（CMD 无标准转义机制）
             command = f"cmd /c {command}"
         elif shell_lower in ("powershell", "pwsh", "ps"):
-            # PowerShell：使用 -EncodedCommand 避免引号嵌套地狱
             import base64
+
             encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
             command = f"powershell -NoProfile -EncodedCommand {encoded}"
         elif shell_lower in ("bash", "sh", "zsh"):
-            # POSIX shell：使用 shlex.quote 安全转义
             command = f"{shell} -c {shlex.quote(command)}"
         else:
-            # 未知 shell：记录日志并原样传递
-            _log.warning("unknown_shell", shell=shell, command=command[:100])
+            _redacted = re.sub(r"(export\s+[A-Za-z_][A-Za-z0-9_]*=)[^;]+", r"\1***", command)
+            _log.warning("unknown_shell", shell=shell, command=_redacted[:100])
     else:
-        # 仅在明确检测到 Windows 命令特征时才添加 cmd 前缀
-        # 使用更精确的特征匹配，避免误判
         cmd_lower = command.lower()
         is_windows_cmd = (
-            # 明确的 Windows 命令
             any(cmd_lower.startswith(p) for p in ("ipconfig", "netstat", "tasklist", "systeminfo", "ver", "vol"))
-            # dir 命令 + 反斜杠路径（强 Windows 特征）
             or ("dir " in cmd_lower and "\\" in command)
-            # 纯 Windows 路径格式
             or (len(command) > 2 and command[1] == ":" and command[2] == "\\")
         )
         if is_windows_cmd:
             command = f"cmd /c {command}"
-            _log.debug("windows_cmd_detected", original=command[:100])
+            _redacted = re.sub(r"(export\s+[A-Za-z_][A-Za-z0-9_]*=)[^;]+", r"\1***", command)
+            _log.debug("windows_cmd_detected", original=_redacted[:100])
 
     return command
 
 
+# ---------------------------------------------------------------------------
+# SFTP 可靠原子传输 helpers
+# ---------------------------------------------------------------------------
+
+
+def _sftp_tmp_name(target: str) -> str:
+    """生成目标同目录的不可预测临时文件名。"""
+    parent = pathlib.PurePosixPath(target).parent
+    name = pathlib.PurePosixPath(target).name
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+    if str(parent) in ("", "."):
+        return tmp
+    return f"{parent}/{tmp}"
+
+
+def _sftp_put_atomic(
+    sftp: paramiko.SFTPClient,
+    local: pathlib.Path,
+    remote: str,
+    overwrite: bool,
+) -> dict:
+    """目标同目录临时名 → 流式写入 → 字节/sha256 校验 → 原子替换。"""
+    if not overwrite:
+        try:
+            sftp.stat(remote)
+            raise FileExistsError(f"远端目标已存在：{remote}（overwrite=False）")
+        except FileNotFoundError:
+            pass
+    tmp_remote = _sftp_tmp_name(remote)
+    local_size = local.stat().st_size
+    try:
+        with local.open("rb") as f:
+            sftp.putfo(f, tmp_remote, confirm=True)
+        remote_stat = sftp.stat(tmp_remote)
+        if remote_stat.st_size != local_size:
+            raise ChecksumMismatchError(
+                f"字节数不一致：local={local_size} remote={remote_stat.st_size}"
+            )
+        local_digest = _sha256_local(local)
+        remote_digest = _sha256_remote(sftp, tmp_remote)
+        if local_digest != remote_digest:
+            raise ChecksumMismatchError("SHA-256 校验不一致")
+        try:
+            sftp.posix_rename(tmp_remote, remote)
+        except (IOError, OSError):
+            sftp.rename(tmp_remote, remote)
+        return {
+            "bytes": local_size,
+            "sha256": local_digest,
+            "tmp_cleaned": False,
+            "atomic": True,
+        }
+    except Exception:
+        try:
+            sftp.remove(tmp_remote)
+        except (IOError, OSError):
+            _log.warning("sftp_tmp_cleanup_failed", remote=tmp_remote)
+        raise
+
+
+def _sftp_get_atomic(
+    sftp: paramiko.SFTPClient,
+    remote: str,
+    local: pathlib.Path,
+) -> dict:
+    """本地同目录临时名 → 远端 size/可选 checksum 校验 → 原子替换。"""
+    remote_stat = sftp.stat(remote)
+    tmp_local = local.parent / f".{local.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        sftp.get(remote, str(tmp_local))
+        local_size = tmp_local.stat().st_size
+        if local_size != remote_stat.st_size:
+            raise ChecksumMismatchError(
+                f"字节数不一致：remote={remote_stat.st_size} local={local_size}"
+            )
+        digest = _sha256_local(tmp_local)
+        tmp_local.replace(local)
+        return {
+            "bytes": local_size,
+            "sha256": digest,
+            "atomic": True,
+        }
+    except Exception:
+        try:
+            tmp_local.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _sftp_bounded_walk(
+    sftp: paramiko.SFTPClient,
+    root: str,
+    max_files: int = _MAX_DIR_FILES,
+    max_bytes: int = _MAX_DIR_BYTES,
+    max_depth: int = _MAX_RECURSE_DEPTH,
+) -> list[dict]:
+    """有界递归遍历：拒绝软链接逃逸、超过文件数/总字节/深度。"""
+    entries: list[dict] = []
+    total_files = 0
+    total_bytes = 0
+
+    def _walk(path: str, depth: int) -> None:
+        nonlocal total_files, total_bytes
+        if depth > max_depth:
+            raise ResourceLimitError(f"递归深度超过限制 {max_depth}")
+        try:
+            attrs = sftp.listdir_attr(path)
+        except FileNotFoundError:
+            return
+        if total_files + len(attrs) > max_files:
+            raise ResourceLimitError(
+                f"目录 {path} 条目数超过剩余配额（{max_files - total_files}）"
+            )
+        for attr in attrs:
+            mode = attr.st_mode
+            if mode & 0o170000 == 0o120000:
+                raise ResourceLimitError(f"拒绝软链接逃逸：{path}/{attr.filename}")
+            child = f"{path}/{attr.filename}" if str(path) not in ("", "/") else f"{path}{attr.filename}"
+            if mode & 0o40000:
+                total_files += 1
+                if total_files > max_files:
+                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
+                entries.append({"path": child, "size": 0, "is_dir": True})
+                _walk(child, depth + 1)
+            elif mode & 0o100000:
+                total_files += 1
+                total_bytes += attr.st_size
+                if total_files > max_files:
+                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
+                if total_bytes > max_bytes:
+                    raise ResourceLimitError(f"总字节超过限制 {max_bytes}")
+                entries.append({"path": child, "size": attr.st_size, "is_dir": False})
+
+    _walk(root, 0)
+    return entries
+
+
+def _local_bounded_walk(
+    root: pathlib.Path,
+    max_files: int = _MAX_DIR_FILES,
+    max_bytes: int = _MAX_DIR_BYTES,
+    max_depth: int = _MAX_RECURSE_DEPTH,
+) -> list[dict]:
+    """本地有界递归：拒绝软链接逃逸、超过文件数/总字节/深度。"""
+    entries: list[dict] = []
+    total_files = 0
+    total_bytes = 0
+
+    def _walk(path: pathlib.Path, depth: int) -> None:
+        nonlocal total_files, total_bytes
+        if depth > max_depth:
+            raise ResourceLimitError(f"递归深度超过限制 {max_depth}")
+        try:
+            children = sorted(path.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return
+        for child in children:
+            if child.is_symlink():
+                raise ResourceLimitError(f"拒绝软链接逃逸：{child}")
+            if child.is_dir():
+                total_files += 1
+                if total_files > max_files:
+                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
+                entries.append({"path": child, "size": 0, "is_dir": True})
+                _walk(child, depth + 1)
+            elif child.is_file():
+                total_files += 1
+                size = child.stat().st_size
+                total_bytes += size
+                if total_files > max_files:
+                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
+                if total_bytes > max_bytes:
+                    raise ResourceLimitError(f"总字节超过限制 {max_bytes}")
+                entries.append({"path": child, "size": size, "is_dir": False})
+
+    _walk(root, 0)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# 14 个 MCP 工具（全部经 _tool_boundary 钩子统一错误边界）
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
+@_tool_boundary("ssh_exec")
 def ssh_exec(
     host: str,
     command: str,
-    timeout: int = 30,
+    timeout: float = 30,
     shell: Optional[str] = None,
     allow_dangerous: bool = False,
-    environment: Optional[dict[str, str]] = None
-) -> str:
-    """在远程主机上执行一条 shell 命令并返回结果。
+    environment: Optional[dict[str, str]] = None,
+) -> dict:
+    """在远程主机上执行一条 shell 命令并返回结果。"""
+    request_id = uuid.uuid4().hex
+    if timeout <= 0:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "timeout 必须大于 0",
+            tool="ssh_exec", host=host, request_id=request_id,
+        ).to_dict()
+    normalized_environment, _, _ = build_environment_plan(environment)
+    try:
+        plan_ctx, review_result = _validate_command(
+            command,
+            allow_dangerous=allow_dangerous,
+            host=host,
+            tool="ssh_exec",
+            shell=shell,
+            environment=normalized_environment,
+        )
+    except ReviewRejectedError as e:
+        return make_rejected(
+            str(e), tool="ssh_exec", host=host, request_id=request_id,
+        ).to_dict()
+    except (ValueError, RuntimeError) as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e),
+            tool="ssh_exec", host=host, request_id=request_id,
+        ).to_dict()
 
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        command: 要执行的 shell 命令，自动处理跨平台编码和特殊字符转义。
-        timeout: 命令超时秒数，默认 30。
-        shell: 指定执行 shell（如 "bash", "sh", "cmd", "powershell"），默认自动检测。
-        allow_dangerous: 是否允许执行高危命令（rm -rf /、mkfs、shutdown 等），默认 False。
-        environment: 额外的环境变量字典，会在命令执行前设置。
-
-    Returns:
-        包含 exit_code / stdout / stderr 的文本，自动适配编码避免乱码。
-    """
-    # 安全校验（委托审核引擎）
-    _validate_command(command, allow_dangerous=allow_dangerous, host=host, tool="ssh_exec")
-    # 命令标准化和跨平台适配
     command = _normalize_command(command, shell=shell)
-    # 处理环境变量
-    if environment:
-        env_prefix = " ".join(f"export {k}={shlex.quote(v)};" for k, v in environment.items())
+    if normalized_environment:
+        env_prefix = " ".join(
+            f"export {k}={shlex.quote(v)};"
+            for k, v in normalized_environment.items()
+        )
         command = f"{env_prefix} {command}"
 
-    client = _connect(host, timeout=timeout)
     t0 = time.monotonic()
+    deadline = t0 + timeout
+    client = None
     try:
+        connect_budget = max(0.1, deadline - time.monotonic())
+        client = _connect(host, timeout=connect_budget)
+        command_budget = max(0.1, deadline - time.monotonic())
         _stdin, stdout, stderr = client.exec_command(
             command,
-            timeout=timeout,
-            get_pty=True  # 分配伪终端，解决部分命令输出不完整/挂起问题
+            timeout=command_budget,
+            get_pty=True,
         )
-        out = _read_channel(stdout.channel, timeout)
-        err = _read_channel(stderr.channel, timeout)
+        out_res = _read_channel(stdout.channel, deadline)
+        err_res = _read_channel(stderr.channel, deadline)
+        if not stdout.channel.exit_status_ready():
+            raise TimeoutError("远程命令未在 timeout deadline 内退出")
         code = stdout.channel.recv_exit_status()
+    except HostKeyError as e:
+        _log.error(
+            "ssh_host_key_mismatch", host=host, command_length=len(command),
+            plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_HOST_KEY_MISMATCH, str(e), tool="ssh_exec", host=host,
+            request_id=request_id, review=_review_summary(review_result),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ).to_dict()
+    except TimeoutError as e:
+        _log.error(
+            "ssh_exec_timed_out", host=host, command_length=len(command),
+            plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_EXEC_TIMEOUT, str(e), tool="ssh_exec", host=host,
+            status=STATUS_TIMED_OUT, request_id=request_id,
+            review=_review_summary(review_result),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ).to_dict()
+    except paramiko.AuthenticationException as e:
+        _log.error(
+            "ssh_exec_auth_failed", host=host, command_length=len(command),
+            plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_AUTH_FAILED, str(e), tool="ssh_exec", host=host,
+            request_id=request_id, review=_review_summary(review_result),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ).to_dict()
+    except (socket.timeout, OSError) as e:
+        _log.error(
+            "ssh_exec_connection_lost", host=host, command_length=len(command),
+            plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_CONNECTION_LOST, str(e), tool="ssh_exec", host=host,
+            request_id=request_id, review=_review_summary(review_result),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ).to_dict()
+    except RuntimeError as e:
+        _log.error(
+            "ssh_exec_connect_failed", host=host, command_length=len(command),
+            plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+        )
+        message = str(e)
+        if "认证失败" in message:
+            code, status = ERROR_AUTH_FAILED, STATUS_FAILED
+        elif "身份文件不存在" in message:
+            code, status = ERROR_INVALID_ARGUMENT, STATUS_FAILED
+        elif "连接超时" in message or "timeout" in message.lower():
+            code, status = ERROR_CONNECT_TIMEOUT, STATUS_TIMED_OUT
+        else:
+            code, status = ERROR_CONNECTION_LOST, STATUS_FAILED
+        return make_failure(
+            code, message, tool="ssh_exec", host=host, status=status,
+            request_id=request_id, review=_review_summary(review_result),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ).to_dict()
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
     elapsed = time.monotonic() - t0
-    _log.info("ssh_exec_done", host=host, command=command[:120],
+    out = out_res["text"]
+    err = err_res["text"]
+    truncated = out_res["truncated"] or err_res["truncated"]
+    _redacted = re.sub(r"(export\s+[A-Za-z_][A-Za-z0-9_]*=)[^;]+", r"\1***", command)
+    _log.info("ssh_exec_done", host=host, command=_redacted[:120],
                exit_code=code, elapsed=round(elapsed, 3),
                out_len=len(out), err_len=len(err), shell=shell)
 
@@ -367,25 +856,79 @@ def ssh_exec(
         parts.append(f"[stdout]\n{out.rstrip()}")
     if err:
         parts.append(f"[stderr]\n{err.rstrip()}")
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if truncated:
+        return make_failure(
+            ERROR_OUTPUT_LIMIT, f"远程命令输出超过配额（最大{_MAX_OUTPUT_BYTES}字节）",
+            tool="ssh_exec", host=host, request_id=request_id,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+            data={
+                "exit_code": code,
+                "stdout": out,
+                "stderr": err,
+                "timed_out": False,
+                "truncated": True,
+            },
+        ).to_dict()
+    if code != 0:
+        return make_failure(
+            ERROR_REMOTE_EXIT_NONZERO,
+            f"远程命令退出码非零：{code}",
+            tool="ssh_exec", host=host, request_id=request_id,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+            data={
+                "exit_code": code,
+                "stdout": out,
+                "stderr": err,
+                "timed_out": False,
+                "truncated": False,
+            },
+        ).to_dict()
+    env = make_success(
+        tool="ssh_exec", host=host,
+        data={
+            "exit_code": code,
+            "stdout": out,
+            "stderr": err,
+            "timed_out": False,
+            "truncated": False,
+        },
+        text=text,
+        request_id=request_id,
+        review=_review_summary(review_result),
+        duration_ms=int(elapsed * 1000),
+    )
+    _log.info("ssh_result_envelope", tool=env.tool, status=env.status,
+               ok=env.ok, error_code=env.error.code if env.error else None)
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_list_hosts() -> str:
+@_tool_boundary("ssh_list_hosts")
+def ssh_list_hosts() -> dict:
     """列出 ~/.ssh/config 中配置的主机别名（排除 * 通配项），跨平台适配。"""
     cfg_path = _SSH_DIR / "config"
     if not cfg_path.exists():
-        # Windows 下检查 ProgramData 下的系统级 SSH 配置
         if platform.system() == "Windows":
             system_cfg = pathlib.Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ssh/ssh_config"
             if system_cfg.exists():
                 cfg_path = system_cfg
             else:
                 _log.warning("ssh_list_hosts_no_config", path=str(cfg_path))
-                return "未找到 ~/.ssh/config，请先创建 SSH 配置（可放 Host 别名）。"
+                return make_failure(
+                    ERROR_INVALID_ARGUMENT,
+                    "未找到 ~/.ssh/config，请先创建 SSH 配置（可放 Host 别名）。",
+                    tool="ssh_list_hosts",
+                ).to_dict()
         else:
             _log.warning("ssh_list_hosts_no_config", path=str(cfg_path))
-            return "未找到 ~/.ssh/config，请先创建 SSH 配置（可放 Host 别名）。"
+            return make_failure(
+                ERROR_INVALID_ARGUMENT,
+                "未找到 ~/.ssh/config，请先创建 SSH 配置（可放 Host 别名）。",
+                tool="ssh_list_hosts",
+            ).to_dict()
     hosts: list[str] = []
     host_configs: dict[str, dict[str, str]] = {}
     current_host: Optional[str] = None
@@ -408,16 +951,30 @@ def ssh_list_hosts() -> str:
                     host_configs[current_host][key] = value.strip()
     _log.info("ssh_list_hosts_done", count=len(hosts))
     if not hosts:
-        return "~/.ssh/config 中没有配置 Host 别名。"
-    # 格式化输出，包含主机详情
+        return make_success(
+            tool="ssh_list_hosts",
+            data={"hosts": []},
+            text="~/.ssh/config 中没有配置 Host 别名。",
+        ).to_dict()
     output = ["配置的主机别名："]
+    entries: list[dict] = []
     for h in sorted(set(hosts)):
         conf = host_configs.get(h, {})
         info = [h]
+        entry = {"alias": h}
         if "hostname" in conf:
             info.append(f"→ {conf.get('user', os.getenv('USERNAME', 'root'))}@{conf['hostname']}:{conf.get('port', '22')}")
+            entry["hostname"] = conf["hostname"]
+            entry["user"] = conf.get("user", os.getenv("USERNAME", "root"))
+            entry["port"] = conf.get("port", "22")
         output.append("  " + " ".join(info))
-    return "\n".join(output)
+        entries.append(entry)
+    env = make_success(
+        tool="ssh_list_hosts",
+        data={"hosts": entries},
+        text="\n".join(output),
+    )
+    return env.to_dict()
 
 
 def _scan_subnet(cidr: str, port: int, per_host_timeout: float, max_workers: int) -> list[dict]:
@@ -434,7 +991,6 @@ def _scan_subnet(cidr: str, port: int, per_host_timeout: float, max_workers: int
         s.settimeout(per_host_timeout)
         try:
             s.connect((ip, port))
-            # 尝试读取 SSH banner 识别设备类型
             banner = ""
             if port == 22:
                 try:
@@ -458,40 +1014,70 @@ def _scan_subnet(cidr: str, port: int, per_host_timeout: float, max_workers: int
 
 
 @mcp.tool()
+@_tool_boundary("ssh_scan")
 def ssh_scan(
     network: str = "192.168.1.0/24",
     port: int = 22,
     timeout: float = 3.0,
     max_workers: int = 100,
     detail: bool = True,
-) -> str:
-    """扫描局域网网段，发现开放指定端口（默认 SSH 22）的在线主机。
-
-    Args:
-        network: CIDR 网段，如 192.168.1.0/24 或 192.168.43.0/24。
-        port: 要扫描的端口，默认 22（SSH）。
-        timeout: 单台主机探测超时秒数，默认 3.0。无线/高延迟网络建议 5.0+。
-        max_workers: 并发扫描线程数，默认 100。/16 大网段建议降到 50。
-        detail: 是否尝试获取 SSH banner 识别设备类型，默认 True。
-
-    Returns:
-        在线主机列表，包含 IP、端口、SSH banner（如有）。
-    """
+) -> dict:
+    """扫描局域网网段，发现开放指定端口（默认 SSH 22）的在线主机。"""
+    try:
+        review_result = _review_context(ReviewContext(
+            tool="ssh_scan",
+            command=(
+                f"scan network={network} port={port} timeout={timeout} "
+                f"max_workers={max_workers} detail={detail}"
+            ),
+            path=network,
+        ))
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_scan").to_dict()
     t0 = time.monotonic()
     _log.info("ssh_scan_start", network=network, port=port, timeout=timeout)
+
+    import ipaddress as _ipaddress
+
+    try:
+        net = _ipaddress.ip_network(network, strict=False)
+        address_count = net.num_addresses
+    except ValueError as e:
+        _log.warning("ssh_scan_bad_cidr", network=network, error=str(e))
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"无效的网段格式：{network}（{e}）",
+            tool="ssh_scan", review=_review_summary(review_result),
+        ).to_dict()
+    if address_count > _MAX_SCAN_ADDRESSES:
+        _log.warning("ssh_scan_limit", network=network, addresses=address_count)
+        return make_failure(
+            ERROR_RESOURCE_LIMIT,
+            f"扫描地址数超过限制（最大{_MAX_SCAN_ADDRESSES}，当前{address_count}）",
+            tool="ssh_scan", review=_review_summary(review_result),
+        ).to_dict()
 
     try:
         results = _scan_subnet(network, port, timeout, max_workers)
     except ValueError as e:
         _log.warning("ssh_scan_bad_cidr", network=network, error=str(e))
-        return f"无效的网段格式：{network}（{e}）"
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"无效的网段格式：{network}（{e}）",
+            tool="ssh_scan", review=_review_summary(review_result),
+        ).to_dict()
 
     elapsed = time.monotonic() - t0
     _log.info("ssh_scan_done", network=network, port=port,
               found=len(results), elapsed=round(elapsed, 3))
 
     if not results:
-        return f"网段 {network} 中未发现开放端口 {port} 的主机（耗时 {round(elapsed, 1)}s）。"
+        text = f"网段 {network} 中未发现开放端口 {port} 的主机（耗时 {round(elapsed, 1)}s）。"
+        return make_success(
+            tool="ssh_scan",
+            data={"network": network, "port": port, "found": 0, "hosts": []},
+            text=text,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+        ).to_dict()
 
     output = [f"🔍 扫描 {network} 端口 {port}，发现 {len(results)} 台在线主机（耗时 {round(elapsed, 1)}s）："]
     output.append("-" * 70)
@@ -502,168 +1088,392 @@ def ssh_scan(
         output.append(f"{i:<4} {host['ip']:<18} {host['port']:<6} {banner}")
     output.append("-" * 70)
     output.append(f"💡 可使用 ssh_exec 在这些主机上执行命令（如 ssh_exec('user@IP', 'hostname')）")
-    return "\n".join(output)
+    env = make_success(
+        tool="ssh_scan",
+        data={
+            "network": network,
+            "port": port,
+            "found": len(results),
+            "hosts": results if detail else [{"ip": h["ip"], "port": h["port"]} for h in results],
+        },
+        text="\n".join(output),
+        review=_review_summary(review_result),
+        duration_ms=int(elapsed * 1000),
+    )
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_upload(host: str, local_path: str, remote_path: str, timeout: int = 60, overwrite: bool = False) -> str:
-    """上传本地文件到远程主机。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        local_path: 本地文件的绝对路径。
-        remote_path: 远程主机上的目标路径。
-        timeout: 传输超时秒数，默认 60。
-        overwrite: 是否允许覆盖系统敏感路径，默认 False。
-    """
+@_tool_boundary("ssh_upload")
+def ssh_upload(host: str, local_path: str, remote_path: str, timeout: int = 60, overwrite: bool = False) -> dict:
+    """上传本地文件到远程主机。"""
     local = pathlib.Path(local_path).expanduser().resolve()
     if not local.exists() or not local.is_file():
-        raise FileNotFoundError(f"本地文件不存在：{local_path}")
-    # 文件大小限制，防止超大文件上传
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"本地文件不存在：{local_path}",
+            tool="ssh_upload", host=host,
+        ).to_dict()
     size = local.stat().st_size
-    if size > 100 * 1024 * 1024:  # 100MB
-        raise RuntimeError(f"文件大小超过限制（最大100MB，当前{round(size/1024/1024, 2)}MB）")
+    if size > _MAX_SINGLE_FILE_BYTES:
+        return make_failure(
+            ERROR_RESOURCE_LIMIT,
+            f"文件大小超过限制（最大{_MAX_SINGLE_FILE_BYTES//1024//1024}MB，当前{round(size/1024/1024, 2)}MB）",
+            tool="ssh_upload", host=host,
+        ).to_dict()
 
-    # 审核引擎校验
     ctx = ReviewContext(
         tool="ssh_upload",
         command=f"upload {local_path} -> {remote_path}",
         host=host,
         path=remote_path,
         allow_dangerous=overwrite,
+        local_path=str(local),
+        remote_path=remote_path,
+        overwrite=overwrite,
     )
-    result = _review_engine.review(ctx)
-    if not result.approved:
-        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+    try:
+        review_result = _review_context(ctx)
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_upload", host=host).to_dict()
 
-    # 敏感路径保护（保留原有逻辑作为兜底）
     if not overwrite and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("upload_to_sensitive_path", remote_path=remote_path)
-        raise RuntimeError(f"禁止上传到敏感路径：{remote_path}，如需覆盖请设置 overwrite=True")
-    client = _connect(host, timeout=timeout)
+        return make_failure(
+            ERROR_INVALID_ARGUMENT,
+            f"禁止上传到敏感路径：{remote_path}，如需覆盖请设置 overwrite=True",
+            tool="ssh_upload", host=host, review=_review_summary(review_result),
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_path)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_upload", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    client = None
     t0 = time.monotonic()
     try:
+        client = _connect(host, timeout=timeout)
         sftp = client.open_sftp()
-        sftp.put(str(local), remote_path)
+        info = _sftp_put_atomic(sftp, local, remote_path, overwrite)
         sftp.close()
         elapsed = time.monotonic() - t0
-        _log.info("ssh_upload_done", host=host, local_path=str(local), remote_path=remote_path,
-                   size=size, elapsed=round(elapsed, 3))
-        return f"上传成功：{local_path} → {host}:{remote_path}（{size} 字节，耗时 {round(elapsed, 2)}s）"
+        _log.info("sftp_atomic_write_ok", host=host, remote=remote_path,
+                   bytes=info["bytes"], sha256=info["sha256"], elapsed=round(elapsed, 3))
+        text = f"上传成功：{local_path} → {host}:{remote_path}（{size} 字节，耗时 {round(elapsed, 2)}s）"
+        env = make_success(
+            tool="ssh_upload", host=host,
+            data={
+                "local_path": str(local),
+                "remote_path": remote_path,
+                "bytes": info["bytes"],
+                "sha256": info["sha256"],
+            },
+            text=text,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+        )
+        return env.to_dict()
+    except (HostKeyError, RuntimeError) as e:
+        _log.error("ssh_upload_connect_failed", host=host, remote=remote_path,
+                    error=str(e), plan_id=ctx.plan_id)
+        return _connect_failure_envelope(
+            e, "ssh_upload", host, review=_review_summary(review_result),
+        )
+    except FileExistsError as e:
+        _log.error("ssh_upload_failed", host=host, local_path=str(local),
+                    remote_path=remote_path, size=size, error=str(e),
+                    plan_id=ctx.plan_id)
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_upload", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except ChecksumMismatchError as e:
+        _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
+                    error=str(e), plan_id=ctx.plan_id)
+        return make_failure(
+            ERROR_CHECKSUM_MISMATCH, str(e), tool="ssh_upload", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except (IOError, OSError) as e:
+        _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
+                    error=str(e), plan_id=ctx.plan_id)
+        return make_failure(
+            ERROR_REMOTE_IO_ERROR, str(e), tool="ssh_upload", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except Exception as e:
+        _log.error(
+            "ssh_upload_failed",
+            host=host,
+            local_path=str(local),
+            remote_path=remote_path,
+            size=size,
+            elapsed=round(time.monotonic() - t0, 3),
+            plan_id=ctx.plan_id,
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_REMOTE_IO_ERROR, str(e), tool="ssh_upload", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 @mcp.tool()
-def ssh_download(host: str, remote_path: str, local_path: str, timeout: int = 60, allow_sensitive: bool = False) -> str:
-    """从远程主机下载文件到本地。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_path: 远程主机上的文件路径。
-        local_path: 本地保存的绝对路径。
-        timeout: 传输超时秒数，默认 60。
-        allow_sensitive: 是否允许下载敏感文件（/etc/shadow、SSH密钥等），默认 False。
-    """
-    # 审核引擎校验
+@_tool_boundary("ssh_download")
+def ssh_download(host: str, remote_path: str, local_path: str, timeout: int = 60, allow_sensitive: bool = False) -> dict:
+    """从远程主机下载文件到本地。"""
+    local = pathlib.Path(local_path).expanduser().resolve()
     ctx = ReviewContext(
         tool="ssh_download",
         command=f"download {remote_path} -> {local_path}",
         host=host,
         path=remote_path,
         allow_dangerous=allow_sensitive,
+        local_path=str(local),
+        remote_path=remote_path,
     )
-    result = _review_engine.review(ctx)
-    if not result.approved:
-        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+    try:
+        review_result = _review_context(ctx)
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_download", host=host).to_dict()
 
-    # 敏感文件保护（保留原有逻辑作为兜底）
     if not allow_sensitive and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("download_sensitive_file", remote_path=remote_path)
-        raise RuntimeError(f"禁止下载敏感文件：{remote_path}，确认需要请设置 allow_sensitive=True")
-    local = pathlib.Path(local_path).expanduser().resolve()
+        return make_failure(
+            ERROR_INVALID_ARGUMENT,
+            f"禁止下载敏感文件：{remote_path}，确认需要请设置 allow_sensitive=True",
+            tool="ssh_download", host=host, review=_review_summary(review_result),
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_path)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_download", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
     local.parent.mkdir(parents=True, exist_ok=True)
-    client = _connect(host, timeout=timeout)
+    client = None
     t0 = time.monotonic()
     try:
+        client = _connect(host, timeout=timeout)
         sftp = client.open_sftp()
-        # 检查远程文件大小
         remote_stat = sftp.stat(remote_path)
-        if remote_stat.st_size > 100 * 1024 * 1024:  # 100MB
-            raise RuntimeError(f"远程文件大小超过限制（最大100MB，当前{round(remote_stat.st_size/1024/1024, 2)}MB）")
-        sftp.get(remote_path, str(local))
+        if remote_stat.st_size > _MAX_SINGLE_FILE_BYTES:
+            sftp.close()
+            return make_failure(
+                ERROR_RESOURCE_LIMIT,
+                f"远程文件大小超过限制（最大{_MAX_SINGLE_FILE_BYTES//1024//1024}MB，"
+                f"当前{round(remote_stat.st_size/1024/1024, 2)}MB）",
+                tool="ssh_download", host=host, review=_review_summary(review_result),
+            ).to_dict()
+        info = _sftp_get_atomic(sftp, remote_path, local)
         sftp.close()
         elapsed = time.monotonic() - t0
-        size = local.stat().st_size
-        _log.info("ssh_download_done", host=host, remote_path=remote_path, local_path=str(local),
-                   size=size, elapsed=round(elapsed, 3))
-        return f"下载成功：{host}:{remote_path} → {local_path}（{size} 字节，耗时 {round(elapsed, 2)}s）"
+        _log.info("ssh_download_done", host=host, remote_path=remote_path,
+                   local_path=str(local), size=info["bytes"], elapsed=round(elapsed, 3))
+        text = f"下载成功：{host}:{remote_path} → {local_path}（{info['bytes']} 字节，耗时 {round(elapsed, 2)}s）"
+        env = make_success(
+            tool="ssh_download", host=host,
+            data={
+                "remote_path": remote_path,
+                "local_path": str(local),
+                "bytes": info["bytes"],
+                "sha256": info["sha256"],
+            },
+            text=text,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+        )
+        return env.to_dict()
+    except (HostKeyError, RuntimeError) as e:
+        _log.error("ssh_download_connect_failed", host=host, remote=remote_path,
+                    error=str(e), plan_id=ctx.plan_id)
+        return _connect_failure_envelope(
+            e, "ssh_download", host, review=_review_summary(review_result),
+        )
+    except ChecksumMismatchError as e:
+        _log.error("ssh_download_failed", host=host, remote_path=remote_path,
+                    local_path=str(local), error=str(e), plan_id=ctx.plan_id)
+        return make_failure(
+            ERROR_CHECKSUM_MISMATCH, str(e), tool="ssh_download", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except FileNotFoundError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_download", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except (IOError, OSError) as e:
+        _log.error("ssh_download_failed", host=host, remote_path=remote_path,
+                    local_path=str(local), error=str(e), plan_id=ctx.plan_id)
+        return make_failure(
+            ERROR_LOCAL_IO_ERROR, str(e), tool="ssh_download", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except Exception as e:
+        _log.error(
+            "ssh_download_failed",
+            host=host,
+            remote_path=remote_path,
+            local_path=str(local),
+            elapsed=round(time.monotonic() - t0, 3),
+            plan_id=ctx.plan_id,
+            error=str(e),
+        )
+        return make_failure(
+            ERROR_REMOTE_IO_ERROR, str(e), tool="ssh_download", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 @mcp.tool()
-def ssh_exec_batch(host: str, commands: list[str], timeout: int = 30, stop_on_error: bool = True) -> str:
-    """批量执行多条命令，支持错误中断。
+@_tool_boundary("ssh_exec_batch")
+def ssh_exec_batch(host: str, commands: list[str], timeout: int = 30, stop_on_error: bool = True) -> dict:
+    """批量执行多条命令，支持错误中断。"""
+    if not commands:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "commands 不能为空",
+            tool="ssh_exec_batch", host=host,
+        ).to_dict()
+    batch_payload = "\0".join(commands) + f"\0timeout={timeout}\0stop_on_error={stop_on_error}"
+    batch_digest = hashlib.sha256(batch_payload.encode("utf-8")).hexdigest()
+    try:
+        review_result = _review_context(ReviewContext(
+            tool="ssh_exec_batch",
+            command=f"batch:{batch_digest}",
+            host=host,
+            path=f"count={len(commands)}",
+            allow_dangerous=False,
+        ))
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_exec_batch", host=host).to_dict()
 
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        commands: 要执行的命令列表。
-        timeout: 单条命令超时秒数，默认 30。
-        stop_on_error: 遇到错误是否停止执行，默认 True。
-    """
-    results = []
+    if timeout <= 0:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "timeout 必须大于 0",
+            tool="ssh_exec_batch", host=host,
+        ).to_dict()
+    deadline = time.monotonic() + timeout
+    items: list[dict] = []
+    any_failed = False
+    stopped_early = False
     for i, cmd in enumerate(commands, 1):
-        results.append(f"\n===== 执行第 {i}/{len(commands)} 条命令：{cmd[:80]} =====")
         try:
-            res = ssh_exec(host, cmd, timeout=timeout)
-            results.append(res)
-            if stop_on_error and "[exit_code] 0" not in res.split("\n")[0]:
-                results.append(f"\n⚠️ 命令执行失败，停止后续执行")
-                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("批处理超过总 timeout deadline")
+            res = ssh_exec(host, cmd, timeout=remaining)
+            item: dict = {
+                "index": i,
+                "command": cmd[:120],
+                "status": res.get("status", STATUS_FAILED),
+                "ok": res.get("ok", False) and res.get("data", {}).get("exit_code") == 0,
+                "exit_code": res.get("data", {}).get("exit_code"),
+                "error": res.get("error"),
+            }
+            items.append(item)
+            if item["status"] != STATUS_SUCCEEDED or item["exit_code"] != 0:
+                any_failed = True
+                if stop_on_error:
+                    stopped_early = True
+                    break
         except Exception as e:
-            results.append(f"执行错误：{str(e)}")
+            any_failed = True
+            items.append({
+                "index": i,
+                "command": cmd[:120],
+                "status": STATUS_FAILED,
+                "ok": False,
+                "exit_code": None,
+                "error": {"code": "REMOTE_EXIT_NONZERO", "message": str(e)},
+            })
             if stop_on_error:
-                results.append(f"\n⚠️ 命令执行异常，停止后续执行")
+                stopped_early = True
                 break
-    return "\n".join(results)
+    status = STATUS_PARTIAL if (any_failed and not stopped_early) else (
+        STATUS_SUCCEEDED if not any_failed else STATUS_FAILED
+    )
+    lines = [f"[batch] executed={len(items)} status={status}"]
+    for item in items:
+        if item["ok"]:
+            lines.append(f"#{item['index']} OK")
+        else:
+            code = (item.get("error") or {}).get("code", "UNKNOWN")
+            lines.append(f"#{item['index']} FAILED {code}")
+    data = {
+        "items": items,
+        "stop_on_error": stop_on_error,
+        "stopped_early": stopped_early,
+        "executed": len(items),
+    }
+    text = "\n".join(lines)
+    if status == STATUS_SUCCEEDED:
+        env = make_success(
+            tool="ssh_exec_batch", host=host,
+            data=data, text=text,
+            review=_review_summary(review_result),
+        )
+    else:
+        code = ERROR_REMOTE_EXIT_NONZERO
+        if stopped_early and status == STATUS_FAILED and any(
+            (it.get("error") or {}).get("code") == "EXEC_TIMEOUT" for it in items
+        ):
+            code = ERROR_EXEC_TIMEOUT
+        env = make_failure(
+            code,
+            f"批处理未全部成功：status={status}",
+            tool="ssh_exec_batch", host=host, status=status,
+            data=data, text=text, review=_review_summary(review_result),
+        )
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, timeout: int = 10) -> str:
-    """列出远程主机指定目录下的文件和子目录。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_path: 远程目录路径，默认当前用户家目录 ~。
-        show_hidden: 是否显示隐藏文件（.开头的文件），默认 False。
-        timeout: 命令超时秒数，默认 10。
-
-    Returns:
-        目录列表，包含文件类型、权限、大小、修改时间、文件名。
-    """
-    # 安全校验：禁止列出敏感目录
+@_tool_boundary("ssh_list_dir")
+def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, timeout: int = 10) -> dict:
+    """列出远程主机指定目录下的文件和子目录。"""
     if not show_hidden and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("list_sensitive_dir", path=remote_path)
-        raise RuntimeError(f"禁止列出敏感目录：{remote_path}")
-    
-    # 构建ls命令
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"禁止列出敏感目录：{remote_path}",
+            tool="ssh_list_dir", host=host,
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_path)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_list_dir", host=host,
+        ).to_dict()
+
     ls_cmd = f"ls -la --time-style=long-iso {shlex.quote(remote_path)}"
     if not show_hidden:
         ls_cmd = f"ls -l --time-style=long-iso {shlex.quote(remote_path)}"
-    
+
     result = ssh_exec(host, ls_cmd, timeout=timeout)
-    if "[exit_code] 0" not in result.split("\n")[0]:
-        return f"列出目录失败：{result}"
-    
-    # 解析输出
-    lines = result.split("\n")
+    if result.get("status") != STATUS_SUCCEEDED:
+        err = result.get("error") or {}
+        return make_failure(
+            err.get("code", ERROR_REMOTE_EXIT_NONZERO),
+            err.get("message", f"列出目录失败：{remote_path}"),
+            tool="ssh_list_dir", host=host,
+        ).to_dict()
+    out = result.get("data", {}).get("stdout", "")
+
+    lines = out.split("\n")
     output = [f"📂 目录：{remote_path}"]
     output.append("-" * 80)
     output.append(f"{'类型':<3} {'权限':<10} {'大小':<10} {'修改时间':<12} 名称")
     output.append("-" * 80)
-    
-    for line in lines[2:]:  # 跳过exit_code和stdout行
+    entries: list[dict] = []
+
+    for line in lines:
         if not line.strip():
             continue
         parts = line.split(maxsplit=6)
@@ -677,236 +1487,456 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
             continue
         if not show_hidden and name.startswith("."):
             continue
-        # 文件类型标识
         ftype = "📁" if perm.startswith("d") else "📄" if perm.startswith("-") else "🔗" if perm.startswith("l") else "❓"
-        # 格式化大小
         try:
             size_num = int(size)
             if size_num < 1024:
                 size_str = f"{size_num}B"
-            elif size_num < 1024*1024:
+            elif size_num < 1024 * 1024:
                 size_str = f"{round(size_num/1024, 1)}KB"
-            elif size_num < 1024*1024*1024:
+            elif size_num < 1024 * 1024 * 1024:
                 size_str = f"{round(size_num/1024/1024, 1)}MB"
             else:
                 size_str = f"{round(size_num/1024/1024/1024, 2)}GB"
-        except:
+        except Exception:
             size_str = size
         output.append(f"{ftype:<3} {perm:<10} {size_str:<10} {mtime:<12}  {name}")
-    
-    return "\n".join(output)
+        entries.append({
+            "name": name,
+            "type": perm[0],
+            "permissions": perm,
+            "size": size_str,
+            "mtime": mtime,
+        })
+
+    env = make_success(
+        tool="ssh_list_dir", host=host,
+        data={"path": remote_path, "entries": entries},
+        text="\n".join(output),
+    )
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> str:
-    """获取远程文件或目录的详细信息。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_path: 远程文件/目录路径。
-        timeout: 命令超时秒数，默认 10。
-    """
+@_tool_boundary("ssh_stat_file")
+def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> dict:
+    """获取远程文件或目录的详细信息。"""
     result = ssh_exec(host, f"stat {shlex.quote(remote_path)}", timeout=timeout)
-    return result
+    if result.get("status") != STATUS_SUCCEEDED:
+        err = result.get("error") or {}
+        return make_failure(
+            err.get("code", ERROR_REMOTE_EXIT_NONZERO),
+            err.get("message", f"stat 失败：{remote_path}"),
+            tool="ssh_stat_file", host=host,
+        ).to_dict()
+    out = result.get("data", {}).get("stdout", "")
+    env = make_success(
+        tool="ssh_stat_file", host=host,
+        data={"path": remote_path, "stat": out},
+        text=f"📄 {remote_path}\n{out}",
+    )
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 10) -> str:
-    """在远程主机创建目录。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_path: 要创建的目录路径。
-        parents: 是否自动创建父目录（类似 mkdir -p），默认 True。
-        timeout: 命令超时秒数，默认 10。
-    """
+@_tool_boundary("ssh_mkdir")
+def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 10) -> dict:
+    """在远程主机创建目录。"""
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("mkdir_sensitive_path", path=remote_path)
-        raise RuntimeError(f"禁止在敏感路径创建目录：{remote_path}")
-    
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"禁止在敏感路径创建目录：{remote_path}",
+            tool="ssh_mkdir", host=host,
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_path)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_mkdir", host=host,
+        ).to_dict()
+
     cmd = f"mkdir {'-p' if parents else ''} {shlex.quote(remote_path)}"
+    try:
+        review_result = _review_context(ReviewContext(
+            tool="ssh_mkdir",
+            command=cmd,
+            host=host,
+            path=remote_path,
+            remote_path=remote_path,
+            recursive=parents,
+            allow_dangerous=True,
+        ))
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_mkdir", host=host).to_dict()
     result = ssh_exec(host, cmd, timeout=timeout, allow_dangerous=True)
-    if "[exit_code] 0" in result.split("\n")[0]:
-        return f"✅ 目录创建成功：{remote_path}"
-    return f"❌ 目录创建失败：{result}"
+    if result.get("status") == STATUS_SUCCEEDED:
+        return make_success(
+            tool="ssh_mkdir", host=host,
+            data={"path": remote_path, "parents": parents},
+            text=f"✅ 目录创建成功：{remote_path}",
+            review=_review_summary(review_result),
+        ).to_dict()
+    err = result.get("error") or {}
+    return make_failure(
+        err.get("code", ERROR_REMOTE_EXIT_NONZERO),
+        err.get("message", f"目录创建失败：{remote_path}"),
+        tool="ssh_mkdir", host=host, review=_review_summary(review_result),
+    ).to_dict()
 
 
 @mcp.tool()
-def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: int = 30) -> str:
-    """删除远程主机上的文件或目录。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_path: 要删除的文件/目录路径。
-        recursive: 是否递归删除目录（类似 rm -rf），默认 False。
-        timeout: 命令超时秒数，默认 30。
-    """
-    # 审核引擎校验
+@_tool_boundary("ssh_remove")
+def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: int = 30) -> dict:
+    """删除远程主机上的文件或目录。"""
     ctx = ReviewContext(
         tool="ssh_remove",
         command=f"remove {remote_path} (recursive={recursive})",
         host=host,
         path=remote_path,
         allow_dangerous=recursive,
+        remote_path=remote_path,
+        recursive=recursive,
     )
-    result = _review_engine.review(ctx)
-    if not result.approved:
-        raise RuntimeError(f"审核拒绝 [{result.mode}]: {result.reason}")
+    try:
+        review_result = _review_context(ctx)
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_remove", host=host).to_dict()
 
-    # 敏感路径保护（保留原有逻辑作为兜底）
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("remove_sensitive_path", path=remote_path)
-        raise RuntimeError(f"禁止删除敏感路径：{remote_path}")
-    
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"禁止删除敏感路径：{remote_path}",
+            tool="ssh_remove", host=host, review=_review_summary(review_result),
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_path)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_remove", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+
     if not recursive:
         cmd = f"rm -f {shlex.quote(remote_path)}"
     else:
         cmd = f"rm -rf {shlex.quote(remote_path)}"
-    
+
     result = ssh_exec(host, cmd, timeout=timeout, allow_dangerous=True)
-    if "[exit_code] 0" in result.split("\n")[0]:
-        return f"✅ 删除成功：{remote_path}"
-    return f"❌ 删除失败：{result}"
+    if result.get("status") == STATUS_SUCCEEDED:
+        return make_success(
+            tool="ssh_remove", host=host,
+            data={"path": remote_path, "recursive": recursive},
+            text=f"✅ 删除成功：{remote_path}",
+            review=_review_summary(review_result),
+        ).to_dict()
+    err = result.get("error") or {}
+    return make_failure(
+        err.get("code", ERROR_REMOTE_EXIT_NONZERO),
+        err.get("message", f"删除失败：{remote_path}"),
+        tool="ssh_remove", host=host, review=_review_summary(review_result),
+    ).to_dict()
 
 
 @mcp.tool()
-def ssh_upload_dir(host: str, local_dir: str, remote_dir: str, overwrite: bool = False, timeout: int = 300) -> str:
-    """上传本地目录到远程主机（递归上传所有文件）。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        local_dir: 本地目录的绝对路径。
-        remote_dir: 远程目标目录路径。
-        overwrite: 是否允许覆盖系统敏感路径，默认 False。
-        timeout: 传输超时秒数，默认 300（5分钟）。
-    """
+@_tool_boundary("ssh_upload_dir")
+def ssh_upload_dir(host: str, local_dir: str, remote_dir: str, overwrite: bool = False, timeout: int = 300) -> dict:
+    """上传本地目录到远程主机（递归上传所有文件）。"""
     local = pathlib.Path(local_dir).expanduser().resolve()
     if not local.exists() or not local.is_dir():
-        raise FileNotFoundError(f"本地目录不存在：{local_dir}")
-    
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, f"本地目录不存在：{local_dir}",
+            tool="ssh_upload_dir", host=host,
+        ).to_dict()
+
     if not overwrite and _SENSITIVE_PATHS.search(remote_dir):
         _log.warning("upload_dir_to_sensitive_path", path=remote_dir)
-        raise RuntimeError(f"禁止上传到敏感路径：{remote_dir}，如需覆盖请设置 overwrite=True")
-    
-    client = _connect(host, timeout=timeout)
+        return make_failure(
+            ERROR_INVALID_ARGUMENT,
+            f"禁止上传到敏感路径：{remote_dir}，如需覆盖请设置 overwrite=True",
+            tool="ssh_upload_dir", host=host,
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_dir)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_upload_dir", host=host,
+        ).to_dict()
+
+    plan_ctx = ReviewContext(
+        tool="ssh_upload_dir",
+        command=f"upload_dir {local_dir} -> {remote_dir}",
+        host=host,
+        path=remote_dir,
+        local_path=str(local),
+        remote_path=remote_dir,
+        recursive=True,
+        overwrite=overwrite,
+    )
+    try:
+        review_result = _review_context(plan_ctx)
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_upload_dir", host=host).to_dict()
+
+    try:
+        local_entries = _local_bounded_walk(local)
+    except ResourceLimitError as e:
+        return make_failure(
+            ERROR_RESOURCE_LIMIT, str(e), tool="ssh_upload_dir", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+
+    client = None
     t0 = time.monotonic()
     uploaded = 0
     total_size = 0
-    
+    skipped: list[dict] = []
+    failed: list[dict] = []
+
     try:
+        client = _connect(host, timeout=timeout)
         sftp = client.open_sftp()
-        # 创建远程目录
         try:
             sftp.stat(remote_dir)
         except FileNotFoundError:
             sftp.mkdir(remote_dir)
-        
-        # 递归上传
-        for item in local.rglob("*"):
-            rel_path = item.relative_to(local)
-            remote_path = f"{remote_dir}/{rel_path.as_posix()}"
-            if item.is_dir():
+
+        for entry in local_entries:
+            rel = entry["path"].relative_to(local)
+            remote_path = f"{remote_dir}/{rel.as_posix()}"
+            if entry["is_dir"]:
                 try:
                     sftp.stat(remote_path)
                 except FileNotFoundError:
                     sftp.mkdir(remote_path)
-            elif item.is_file():
-                size = item.stat().st_size
-                if size > 100 * 1024 * 1024:
-                    _log.warning("skip_large_file", path=str(item), size=size)
-                    continue
-                # 确保父目录存在
-                remote_parent = str(pathlib.PurePosixPath(remote_path).parent)
-                try:
-                    sftp.stat(remote_parent)
-                except FileNotFoundError:
-                    sftp.mkdir(remote_parent)
-                sftp.put(str(item), remote_path)
+                continue
+            if entry["size"] > _MAX_SINGLE_FILE_BYTES:
+                skipped.append({"path": str(rel), "reason": "size_limit"})
+                continue
+            try:
+                info = _sftp_put_atomic(sftp, entry["path"], remote_path, overwrite)
                 uploaded += 1
-                total_size += size
-        
+                total_size += info["bytes"]
+            except FileExistsError:
+                skipped.append({"path": str(rel), "reason": "exists"})
+            except ChecksumMismatchError as e:
+                failed.append({"path": str(rel), "reason": str(e)})
+                _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
+                            error=str(e), plan_id=plan_ctx.plan_id)
+                break
+            except (IOError, OSError) as e:
+                failed.append({"path": str(rel), "reason": str(e)})
+                _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
+                            error=str(e), plan_id=plan_ctx.plan_id)
+                break
+
         sftp.close()
         elapsed = time.monotonic() - t0
-        _log.info("ssh_upload_dir_done", host=host, local_dir=str(local), remote_dir=remote_dir,
-                   files=uploaded, size=total_size, elapsed=round(elapsed, 3))
-        return f"✅ 目录上传成功：{local_dir} → {host}:{remote_dir}\n📊 上传文件：{uploaded} 个，总大小：{round(total_size/1024/1024, 2)}MB，耗时：{round(elapsed, 2)}s"
+        status = STATUS_PARTIAL if (failed or skipped) else STATUS_SUCCEEDED
+        _log.info("ssh_upload_dir_done", host=host, local_dir=str(local),
+                   remote_dir=remote_dir, files=uploaded, size=total_size,
+                   skipped=len(skipped), failed=len(failed), elapsed=round(elapsed, 3))
+        text = (f"✅ 目录上传完成：{local_dir} → {host}:{remote_dir}（status={status}）\n"
+                f"📊 上传文件：{uploaded} 个，总大小：{round(total_size/1024/1024, 2)}MB，"
+                f"耗时：{round(elapsed, 2)}s"
+                + (f"，跳过 {len(skipped)} 个，失败 {len(failed)} 个" if status == STATUS_PARTIAL else ""))
+        env = make_success(
+            tool="ssh_upload_dir", host=host,
+            data={
+                "local_dir": str(local),
+                "remote_dir": remote_dir,
+                "uploaded": uploaded,
+                "bytes": total_size,
+                "skipped": skipped,
+                "failed": failed,
+            },
+            text=text,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+            status=status,
+        )
+        return env.to_dict()
+    except (HostKeyError, RuntimeError) as e:
+        _log.error("ssh_upload_dir_connect_failed", host=host, remote=remote_dir,
+                    error=str(e), plan_id=plan_ctx.plan_id)
+        return _connect_failure_envelope(
+            e, "ssh_upload_dir", host, review=_review_summary(review_result),
+        )
+    except ResourceLimitError as e:
+        _log.error("sftp_bounded_walk_limit", host=host, remote=remote_dir, error=str(e))
+        return make_failure(
+            ERROR_RESOURCE_LIMIT, str(e), tool="ssh_upload_dir", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
+    except Exception as e:
+        _log.error(
+            "ssh_upload_dir_failed",
+            host=host,
+            local_dir=str(local),
+            remote_dir=remote_dir,
+            files=uploaded,
+            size=total_size,
+            elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+            plan_id=plan_ctx.plan_id,
+        )
+        return make_failure(
+            ERROR_REMOTE_IO_ERROR, str(e), tool="ssh_upload_dir", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 @mcp.tool()
-def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive: bool = False, timeout: int = 300) -> str:
-    """从远程主机下载目录到本地（递归下载所有文件）。
-
-    Args:
-        host: ~/.ssh/config 中的主机别名，或 user@hostname 形式。
-        remote_dir: 远程目录路径。
-        local_dir: 本地保存目录的绝对路径。
-        allow_sensitive: 是否允许下载敏感目录，默认 False。
-        timeout: 传输超时秒数，默认 300（5分钟）。
-    """
+@_tool_boundary("ssh_download_dir")
+def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive: bool = False, timeout: int = 300) -> dict:
+    """从远程主机下载目录到本地（递归下载所有文件）。"""
     if not allow_sensitive and _SENSITIVE_PATHS.search(remote_dir):
         _log.warning("download_sensitive_dir", path=remote_dir)
-        raise RuntimeError(f"禁止下载敏感目录：{remote_dir}，确认需要请设置 allow_sensitive=True")
-    
+        return make_failure(
+            ERROR_INVALID_ARGUMENT,
+            f"禁止下载敏感目录：{remote_dir}，确认需要请设置 allow_sensitive=True",
+            tool="ssh_download_dir", host=host,
+        ).to_dict()
+    try:
+        _reject_remote_traversal(remote_dir)
+    except ValueError as e:
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_download_dir", host=host,
+        ).to_dict()
+
     local = pathlib.Path(local_dir).expanduser().resolve()
+    plan_ctx = ReviewContext(
+        tool="ssh_download_dir",
+        command=f"download_dir {remote_dir} -> {local_dir}",
+        host=host,
+        path=remote_dir,
+        local_path=str(local),
+        remote_path=remote_dir,
+        recursive=True,
+    )
+    try:
+        review_result = _review_context(plan_ctx)
+    except ReviewRejectedError as e:
+        return make_rejected(str(e), tool="ssh_download_dir", host=host).to_dict()
     local.mkdir(parents=True, exist_ok=True)
-    
-    client = _connect(host, timeout=timeout)
+
+    client = None
     t0 = time.monotonic()
     downloaded = 0
     total_size = 0
-    
+    skipped: list[dict] = []
+    failed: list[dict] = []
+
     try:
+        client = _connect(host, timeout=timeout)
         sftp = client.open_sftp()
-        
-        def _download_dir(remote_path, local_path):
-            nonlocal downloaded, total_size
+        try:
+            remote_entries = _sftp_bounded_walk(sftp, remote_dir)
+        except ResourceLimitError as e:
+            sftp.close()
+            _log.error("sftp_bounded_walk_limit", host=host, remote=remote_dir, error=str(e))
+            return make_failure(
+                ERROR_RESOURCE_LIMIT, str(e), tool="ssh_download_dir", host=host,
+                review=_review_summary(review_result),
+            ).to_dict()
+
+        for entry in remote_entries:
+            remote_item = entry["path"]
+            rel = pathlib.PurePosixPath(remote_item).relative_to(remote_dir)
+            local_item = local / rel
+            if entry["is_dir"]:
+                local_item.mkdir(parents=True, exist_ok=True)
+                continue
+            if entry["size"] > _MAX_SINGLE_FILE_BYTES:
+                skipped.append({"path": str(rel), "reason": "size_limit"})
+                continue
+            local_item.parent.mkdir(parents=True, exist_ok=True)
             try:
-                sftp.stat(remote_path)
-            except FileNotFoundError:
-                return
-            local_path.mkdir(parents=True, exist_ok=True)
-            for item in sftp.listdir_attr(remote_path):
-                remote_item = f"{remote_path}/{item.filename}"
-                local_item = local_path / item.filename
-                if item.st_mode & 0o40000:  # 目录
-                    _download_dir(remote_item, local_item)
-                elif item.st_mode & 0o100000:  # 文件
-                    if item.st_size > 100 * 1024 * 1024:
-                        _log.warning("skip_large_remote_file", path=remote_item, size=item.st_size)
-                        continue
-                    sftp.get(remote_item, str(local_item))
-                    downloaded += 1
-                    total_size += item.st_size
-        
-        _download_dir(remote_dir, local)
+                info = _sftp_get_atomic(sftp, remote_item, local_item)
+                downloaded += 1
+                total_size += info["bytes"]
+            except ChecksumMismatchError as e:
+                failed.append({"path": str(rel), "reason": str(e)})
+                _log.error("sftp_atomic_write_failed", host=host, remote=remote_item,
+                            error=str(e), plan_id=plan_ctx.plan_id)
+                break
+            except (IOError, OSError) as e:
+                failed.append({"path": str(rel), "reason": str(e)})
+                _log.error("sftp_atomic_write_failed", host=host, remote=remote_item,
+                            error=str(e), plan_id=plan_ctx.plan_id)
+                break
+
         sftp.close()
         elapsed = time.monotonic() - t0
-        _log.info("ssh_download_dir_done", host=host, remote_dir=remote_dir, local_dir=str(local),
-                   files=downloaded, size=total_size, elapsed=round(elapsed, 3))
-        return f"✅ 目录下载成功：{host}:{remote_dir} → {local_dir}\n📊 下载文件：{downloaded} 个，总大小：{round(total_size/1024/1024, 2)}MB，耗时：{round(elapsed, 2)}s"
+        status = STATUS_PARTIAL if (failed or skipped) else STATUS_SUCCEEDED
+        _log.info("ssh_download_dir_done", host=host, remote_dir=remote_dir,
+                   local_dir=str(local), files=downloaded, size=total_size,
+                   skipped=len(skipped), failed=len(failed), elapsed=round(elapsed, 3))
+        text = (f"✅ 目录下载完成：{host}:{remote_dir} → {local_dir}（status={status}）\n"
+                f"📊 下载文件：{downloaded} 个，总大小：{round(total_size/1024/1024, 2)}MB，"
+                f"耗时：{round(elapsed, 2)}s"
+                + (f"，跳过 {len(skipped)} 个，失败 {len(failed)} 个" if status == STATUS_PARTIAL else ""))
+        env = make_success(
+            tool="ssh_download_dir", host=host,
+            data={
+                "remote_dir": remote_dir,
+                "local_dir": str(local),
+                "downloaded": downloaded,
+                "bytes": total_size,
+                "skipped": skipped,
+                "failed": failed,
+            },
+            text=text,
+            review=_review_summary(review_result),
+            duration_ms=int(elapsed * 1000),
+            status=status,
+        )
+        return env.to_dict()
+    except (HostKeyError, RuntimeError) as e:
+        _log.error("ssh_download_dir_connect_failed", host=host, remote=remote_dir,
+                    error=str(e), plan_id=plan_ctx.plan_id)
+        return _connect_failure_envelope(
+            e, "ssh_download_dir", host, review=_review_summary(review_result),
+        )
+    except Exception as e:
+        _log.error(
+            "ssh_download_dir_failed",
+            host=host,
+            remote_dir=remote_dir,
+            local_dir=str(local),
+            files=downloaded,
+            size=total_size,
+            elapsed=round(time.monotonic() - t0, 3),
+            error=str(e),
+            plan_id=plan_ctx.plan_id,
+        )
+        return make_failure(
+            ERROR_REMOTE_IO_ERROR, str(e), tool="ssh_download_dir", host=host,
+            review=_review_summary(review_result),
+        ).to_dict()
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 # ---------------------------------------------------------------------------
 # 审核模式管理工具
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def ssh_get_review_mode() -> str:
-    """获取当前审核模式及状态信息。
 
-    Returns:
-        当前审核模式、白名单文件路径、人工确认超时等状态。
-    """
+@mcp.tool()
+@_tool_boundary("ssh_get_review_mode")
+def ssh_get_review_mode() -> dict:
+    """获取当前审核模式及状态信息。"""
     status = _review_engine.get_status()
     lines = [
         f"🔒 审核模式: {status['mode']}",
         f"📋 白名单文件: {status['whitelist_file']}",
         f"   文件存在: {'是' if status['whitelist_exists'] else '否（使用内置默认规则）'}",
         f"⏱️  人工确认超时: {status['manual_timeout']}s",
+        f"🔑 运行时切换授权: {'是' if status['runtime_switch_enabled'] else '否'}",
         "",
         "可选模式:",
         "  off       - 关闭审核，所有操作直接放行（仅记日志）",
@@ -914,24 +1944,37 @@ def ssh_get_review_mode() -> str:
         "  manual    - 人工审核，每条命令需人工确认",
         "  smart     - 智能审核，本地规则初筛，不确定时转人工",
     ]
-    return "\n".join(lines)
+    env = make_success(
+        tool="ssh_get_review_mode",
+        data={"status": status},
+        text="\n".join(lines),
+    )
+    return env.to_dict()
 
 
 @mcp.tool()
-def ssh_set_review_mode(mode: str) -> str:
-    """动态切换审核模式。
-
-    Args:
-        mode: 审核模式，可选: off, whitelist, manual, smart
-
-    Returns:
-        切换结果提示。
-    """
-    success, message = _review_engine.set_mode(mode)
+@_tool_boundary("ssh_set_review_mode")
+def ssh_set_review_mode(mode: str) -> dict:
+    """动态切换审核模式。"""
+    old_mode = _review_engine.get_mode()
+    success, message = _review_engine.set_mode(
+        mode,
+        authorized=_review_engine.config.allow_runtime_switch,
+    )
+    data = {"old_mode": old_mode, "new_mode": mode, "success": success}
+    text = f"✅ {message}" if success else f"❌ {message}"
     if success:
-        return f"✅ {message}"
-    else:
-        return f"❌ {message}"
+        return make_success(
+            tool="ssh_set_review_mode",
+            data=data,
+            text=text,
+        ).to_dict()
+    return make_failure(
+        ERROR_INVALID_ARGUMENT, message,
+        tool="ssh_set_review_mode",
+        data=data,
+        text=text,
+    ).to_dict()
 
 
 def main() -> None:

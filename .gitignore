@@ -179,3 +179,24 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# ---------------------------------------------------------------------------
+# mcp-ssh 项目专属规则（1.0.0 发布）
+# ---------------------------------------------------------------------------
+
+# ADD 流程中文审阅临时副本（不随发布物提交）
+docs/*-hitl-review.zh-CN.md
+docs/*-plan-review-hitl.zh-CN.md
+
+# 开发环境产物文档（历史 PRD / ADD 运维草稿，不随发布物提交）
+docs/full-automation-control-prd-v1.md
+docs/full-automation-control-prd-v1.zh-CN.md
+docs/operations.md
+
+# VS Code / IDE 本地工作区
+.vscode/
+.idea/
+
+# 本地测试遗留
+*.tmp
+.venv-wsl/

@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import re
 import sys
 import threading
@@ -21,11 +23,36 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from logger import get_logger
 
 _log = get_logger()
+
+
+def build_environment_plan(
+    environment: Mapping[str, str] | None,
+) -> tuple[dict[str, str], tuple[str, ...], str]:
+    """Normalize environment names and return a value-safe plan digest."""
+    if not environment:
+        return {}, (), ""
+
+    normalized: dict[str, str] = {}
+    for raw_name, value in environment.items():
+        if not isinstance(raw_name, str) or not isinstance(value, str):
+            raise TypeError("environment 必须是字符串键值对")
+        name = raw_name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(f"非法环境变量名: {raw_name}")
+        normalized[name] = value
+
+    canonical = json.dumps(
+        sorted(normalized.items()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    return normalized, tuple(sorted(normalized)), digest
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +82,7 @@ class ReviewMode(Enum):
 # 审核结果
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class ReviewResult:
     """审核结果。"""
     approved: bool
@@ -63,6 +90,7 @@ class ReviewResult:
     reason: str = ""
     risk_level: str = "unknown"  # low / medium / high / critical
     elapsed: float = 0.0
+    plan_id: str = ""
 
     def __bool__(self) -> bool:
         return self.approved
@@ -72,14 +100,68 @@ class ReviewResult:
 # 审核上下文
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class ReviewContext:
-    """审核上下文信息。"""
+    """审核绑定的不可变操作计划。"""
     tool: str  # 调用的工具名，如 ssh_exec / ssh_upload
     command: str = ""  # 要执行的命令
     host: str = ""  # 目标主机
     path: str = ""  # 涉及的路径（文件操作时）
     allow_dangerous: bool = False  # 是否显式允许危险操作
+    shell: Optional[str] = None
+    environment: tuple[str, ...] = ()  # 只记录变量名，不记录敏感值
+    local_path: str = ""
+    remote_path: str = ""
+    recursive: bool = False
+    overwrite: bool = False
+    environment_digest: str = ""
+
+    def __post_init__(self) -> None:
+        string_fields = {
+            "tool": self.tool,
+            "command": self.command,
+            "host": self.host,
+            "path": self.path,
+            "local_path": self.local_path,
+            "remote_path": self.remote_path,
+        }
+        if self.shell is not None:
+            string_fields["shell"] = self.shell
+        for name, value in string_fields.items():
+            if not isinstance(value, str):
+                raise TypeError(f"{name} 必须是字符串")
+        if not isinstance(self.environment, tuple) or not all(
+            isinstance(name, str) for name in self.environment
+        ):
+            raise TypeError("environment 必须是环境变量名称元组")
+        if not isinstance(self.environment_digest, str):
+            raise TypeError("environment_digest 必须是字符串")
+        if not isinstance(self.allow_dangerous, bool):
+            raise TypeError("allow_dangerous 必须是布尔值")
+        if not isinstance(self.recursive, bool):
+            raise TypeError("recursive 必须是布尔值")
+        if not isinstance(self.overwrite, bool):
+            raise TypeError("overwrite 必须是布尔值")
+
+    @property
+    def plan_id(self) -> str:
+        """返回绑定所有执行字段的稳定摘要。"""
+        payload = {
+            "tool": self.tool,
+            "command": self.command,
+            "host": self.host,
+            "path": self.path,
+            "allow_dangerous": self.allow_dangerous,
+            "shell": self.shell,
+            "environment": self.environment,
+            "local_path": self.local_path,
+            "remote_path": self.remote_path,
+            "recursive": self.recursive,
+            "overwrite": self.overwrite,
+            "environment_digest": self.environment_digest,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +177,28 @@ class BaseReviewer:
     def review(self, ctx: ReviewContext) -> ReviewResult:
         raise NotImplementedError
 
+    def _invalid_context(self, ctx: ReviewContext, mode: str) -> ReviewResult | None:
+        """审核模式可关闭，但无效操作计划不能被放行。"""
+        reason = ""
+        if not ctx.tool.strip():
+            reason = "工具名称不能为空"
+        elif ctx.tool.startswith("ssh_") and ctx.tool not in {
+            "ssh_get_review_mode",
+            "ssh_set_review_mode",
+            "ssh_list_hosts",
+            "ssh_scan",
+        } and not ctx.host.strip():
+            reason = "SSH 操作缺少目标主机"
+        if not reason:
+            return None
+        return ReviewResult(
+            approved=False,
+            mode=mode,
+            reason=reason,
+            risk_level="high",
+            plan_id=ctx.plan_id,
+        )
+
     def _log_audit(self, ctx: ReviewContext, result: ReviewResult) -> None:
         """记录审计日志。"""
         _log.info(
@@ -104,9 +208,10 @@ class BaseReviewer:
             approved=result.approved,
             risk_level=result.risk_level,
             reason=result.reason,
-            command=ctx.command[:200] if ctx.command else "",
+            plan_id=ctx.plan_id,
+            command_length=len(ctx.command),
             host=ctx.host,
-            path=ctx.path,
+            environment_count=len(ctx.environment),
             elapsed=round(result.elapsed, 3),
         )
 
@@ -120,12 +225,16 @@ class OffReviewer(BaseReviewer):
 
     def review(self, ctx: ReviewContext) -> ReviewResult:
         t0 = time.monotonic()
+        if (invalid := self._invalid_context(ctx, "off")) is not None:
+            self._log_audit(ctx, invalid)
+            return invalid
         result = ReviewResult(
             approved=True,
             mode="off",
             reason="审核已关闭，直接放行",
             risk_level="unknown",
             elapsed=time.monotonic() - t0,
+            plan_id=ctx.plan_id,
         )
         self._log_audit(ctx, result)
         return result
@@ -190,7 +299,23 @@ class WhitelistReviewer(BaseReviewer):
 
     def review(self, ctx: ReviewContext) -> ReviewResult:
         t0 = time.monotonic()
+        if (invalid := self._invalid_context(ctx, "whitelist")) is not None:
+            self._log_audit(ctx, invalid)
+            return invalid
         cmd = ctx.command.strip()
+
+        # 内置白名单只允许单条命令，控制运算符必须由人工/智能模式审核。
+        if any(token in cmd for token in ("\n", "\r", ";", "&&", "||", "`", "$(")):
+            result = ReviewResult(
+                approved=False,
+                mode="whitelist",
+                reason="白名单模式不允许 shell 控制运算符或多行命令",
+                risk_level="medium",
+                elapsed=time.monotonic() - t0,
+                plan_id=ctx.plan_id,
+            )
+            self._log_audit(ctx, result)
+            return result
 
         # 检查是否匹配白名单
         for pattern in self._whitelist:
@@ -201,6 +326,7 @@ class WhitelistReviewer(BaseReviewer):
                     reason=f"匹配白名单规则: {pattern.pattern}",
                     risk_level="low",
                     elapsed=time.monotonic() - t0,
+                    plan_id=ctx.plan_id,
                 )
                 self._log_audit(ctx, result)
                 return result
@@ -212,6 +338,7 @@ class WhitelistReviewer(BaseReviewer):
             reason="命令不在白名单中，拒绝执行。可通过 ssh_set_review_mode 切换模式或添加白名单规则。",
             risk_level="medium",
             elapsed=time.monotonic() - t0,
+            plan_id=ctx.plan_id,
         )
         self._log_audit(ctx, result)
         return result
@@ -226,18 +353,9 @@ class ManualReviewer(BaseReviewer):
 
     def review(self, ctx: ReviewContext) -> ReviewResult:
         t0 = time.monotonic()
-
-        # 如果显式设置了 allow_dangerous，跳过人工确认
-        if ctx.allow_dangerous:
-            result = ReviewResult(
-                approved=True,
-                mode="manual",
-                reason="显式 allow_dangerous=True，跳过人工确认",
-                risk_level="high",
-                elapsed=time.monotonic() - t0,
-            )
-            self._log_audit(ctx, result)
-            return result
+        if (invalid := self._invalid_context(ctx, "manual")) is not None:
+            self._log_audit(ctx, invalid)
+            return invalid
 
         # 打印待审核命令
         self._print_review_banner(ctx)
@@ -251,6 +369,7 @@ class ManualReviewer(BaseReviewer):
             reason="人工批准" if approved else "人工拒绝或超时",
             risk_level="medium" if approved else "high",
             elapsed=time.monotonic() - t0,
+            plan_id=ctx.plan_id,
         )
         self._log_audit(ctx, result)
         return result
@@ -274,7 +393,13 @@ class ManualReviewer(BaseReviewer):
   工具:     {ctx.tool}
   主机:     {ctx.host or 'N/A'}
   命令:     {ctx.command[:200]}
+  Shell:    {ctx.shell or 'default'}
   路径:     {ctx.path or 'N/A'}
+  本地路径: {ctx.local_path or 'N/A'}
+  远端路径: {ctx.remote_path or 'N/A'}
+  环境变量: {', '.join(ctx.environment) or 'N/A'}
+  递归/覆盖: {ctx.recursive}/{ctx.overwrite}
+  计划摘要: {ctx.plan_id}
   危险标记: {ctx.allow_dangerous}
 {'='*70}
 请在 {self.config.manual_timeout}s 内确认：
@@ -286,6 +411,15 @@ class ManualReviewer(BaseReviewer):
 
     def _wait_for_confirmation(self, ctx: ReviewContext) -> bool:
         """等待人工确认，支持超时。"""
+        # MCP stdio 独占 stdin；非交互环境必须失败关闭，不能消费协议帧。
+        if not sys.stdin.isatty():
+            self._safe_print(
+                "[拒绝] 当前客户端未提供独立人工审核通道",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
         timeout = self.config.manual_timeout
         deadline = time.monotonic() + timeout
 
@@ -354,12 +488,15 @@ class SmartReviewer(BaseReviewer):
         # 安全命令白名单（高置信度放行）
         self._safe_patterns = [
             re.compile(r"^(ls|ll|pwd|whoami|hostname|uname|df|free|uptime|date)$", re.IGNORECASE),
-            re.compile(r"^(cat|head|tail|grep|find|wc|echo|ping|ps)\s+[^|;&]*$", re.IGNORECASE),
+            re.compile(r"^(cat|head|tail|grep|find|wc|echo|ping|ps)\s+[^\r\n|;&]*$", re.IGNORECASE),
             re.compile(r"^git\s+(status|log|diff|show|branch)$", re.IGNORECASE),
         ]
 
     def review(self, ctx: ReviewContext) -> ReviewResult:
         t0 = time.monotonic()
+        if (invalid := self._invalid_context(ctx, "smart")) is not None:
+            self._log_audit(ctx, invalid)
+            return invalid
         cmd = ctx.command.strip()
 
         # 1. 黑名单检查（高置信度拒绝）
@@ -371,6 +508,7 @@ class SmartReviewer(BaseReviewer):
                     reason=f"命中危险命令黑名单: {pattern.pattern}。如需执行请设置 allow_dangerous=True。",
                     risk_level="critical",
                     elapsed=time.monotonic() - t0,
+                    plan_id=ctx.plan_id,
                 )
                 self._log_audit(ctx, result)
                 return result
@@ -384,6 +522,7 @@ class SmartReviewer(BaseReviewer):
                     reason=f"匹配安全命令白名单: {pattern.pattern}",
                     risk_level="low",
                     elapsed=time.monotonic() - t0,
+                    plan_id=ctx.plan_id,
                 )
                 self._log_audit(ctx, result)
                 return result
@@ -391,9 +530,14 @@ class SmartReviewer(BaseReviewer):
         # 3. 不确定 → 降级为人工审核
         _log.info("smart_review_fallback_to_manual", command=cmd[:100])
         manual_result = self._manual_reviewer.review(ctx)
-        manual_result.mode = "smart(manual)"
-        manual_result.reason = f"[智能审核→人工] {manual_result.reason}"
-        return manual_result
+        return ReviewResult(
+            approved=manual_result.approved,
+            mode="smart(manual)",
+            reason=f"[智能审核→人工] {manual_result.reason}",
+            risk_level=manual_result.risk_level,
+            elapsed=time.monotonic() - t0,
+            plan_id=ctx.plan_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +550,7 @@ class ReviewConfig:
     mode: ReviewMode = field(default_factory=ReviewMode.from_env)
     whitelist_file: Optional[Path] = None
     manual_timeout: int = 60
+    allow_runtime_switch: bool = False
 
     def __post_init__(self) -> None:
         # 白名单文件路径
@@ -420,7 +565,13 @@ class ReviewConfig:
             try:
                 self.manual_timeout = int(env_timeout)
             except ValueError:
-                pass
+                raise ValueError("SSH_REVIEW_MANUAL_TIMEOUT 必须是整数")
+        if self.manual_timeout <= 0:
+            raise ValueError("manual_timeout 必须大于 0")
+
+        env_switch = os.getenv("SSH_REVIEW_ALLOW_RUNTIME_SWITCH")
+        if env_switch is not None:
+            self.allow_runtime_switch = env_switch.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -461,13 +612,16 @@ class ReviewEngine:
         reviewer = self._reviewers[self.config.mode]
         return reviewer.review(ctx)
 
-    def set_mode(self, mode: ReviewMode | str) -> tuple[bool, str]:
-        """动态切换审核模式。"""
+    def set_mode(self, mode: ReviewMode | str, *, authorized: bool = False) -> tuple[bool, str]:
+        """由外部管理员授权后切换审核模式。"""
         if isinstance(mode, str):
             try:
                 mode = ReviewMode(mode.lower().strip())
             except ValueError:
                 return False, f"无效的审核模式: {mode}。可选: off, whitelist, manual, smart"
+
+        if not authorized:
+            return False, "运行时切换审核模式需要管理员授权"
 
         old_mode = self.config.mode
         self.config.mode = mode
@@ -485,6 +639,7 @@ class ReviewEngine:
             "whitelist_file": str(self.config.whitelist_file),
             "whitelist_exists": self.config.whitelist_file.exists() if self.config.whitelist_file else False,
             "manual_timeout": self.config.manual_timeout,
+            "runtime_switch_enabled": self.config.allow_runtime_switch,
         }
 
 
