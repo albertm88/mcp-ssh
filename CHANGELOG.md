@@ -2,6 +2,32 @@
 
 All notable changes are recorded here. The project follows Semantic Versioning.
 
+## [1.0.0-lite] - 2026-08-10（简化版正式发布，lite 分支）
+
+### Changed
+
+- **工具精简**：15 → 11 个 MCP 工具。
+  - `ssh_list_dir`/`ssh_stat_file`/`ssh_mkdir`/`ssh_remove` 合并为 `ssh_filesystem`（`action` 参数：`list`/`stat`/`mkdir`/`remove`）。
+  - 移除 `ssh_scan`（网络扫描）及 `_scan_subnet`。
+  - `_sftp_bounded_walk`/`_local_bounded_walk` 合并为统一 `_bounded_walk(sftp=)`。
+- **保留完整功能**：`ssh_exec`、`ssh_exec_batch`、`ssh_upload`、`ssh_download`、`ssh_upload_dir`、`ssh_download_dir`、`ssh_list_hosts`、审核/审计工具行为不变。
+
+### Security
+
+- **防御纵深**：`_DANGEROUS_COMMANDS`/`_INJECTION_PATTERNS` 接线到 `_validate_command`，注入/危险命令拦截在所有审核模式（含 off）生效；危险命令仅 `allow_dangerous=True` 豁免。
+- **fork bomb 检测加固**：正则匹配 `:(){:|:&};:` 无空格变体。
+
+### Fixed
+
+- 空/空白 `remote_path` 失败关闭（`INVALID_ARGUMENT`），不再尝试连接。
+- `ssh_filesystem(list)` 解析修复：name 从 `HH:MM` 时间列后正确提取、剥离 CRLF。
+- mypy 零错误基线（重复 `main()`、`Optional` 默认值等）。
+
+### Quality
+
+- 新增 `tests/test_filesystem.py`（13 用例）与 `tests/test_command_structure.py`（64 用例）。
+- 测试总数 120 → 203；WSL2 真实 E2E 全绿（hostname/SFTP/超时/防御纵深故障注入）。
+
 ## [Unreleased] - 2026-08-09（候选变更）
 
 ### Added

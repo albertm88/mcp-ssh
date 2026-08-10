@@ -4,7 +4,8 @@
 
 | Version | Security status |
 | --- | --- |
-| `1.0.0-main` (current release) | Actively supported |
+| `1.0.0-lite` (current release, `lite` branch) | Actively supported |
+| `1.0.1` (`main` branch) | Actively supported |
 | `` (unreleased) | Best-effort fixes during development |
 | `0.x` (including the historical `Ver.1.0.0` demo tag) | Not supported as a production release |
 

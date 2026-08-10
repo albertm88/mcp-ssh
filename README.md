@@ -1,6 +1,6 @@
 # mcp-ssh
 
-**轻量级跨平台 SSH MCP 服务器** — 让 AI 助手安全地管理远程服务器。
+**跨平台 SSH MCP 服务器（简化版）** — 让 AI 助手安全地管理远程服务器。
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
