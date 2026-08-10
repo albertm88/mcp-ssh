@@ -20,6 +20,39 @@
 
 ---
 
+## Edition family (1 main + 2 branches)
+
+Three editions are maintained in parallel, sharing the same envelope contract, 4 review modes and defense-in-depth — clients can switch without breaking:
+
+| Edition | Branch | Implementation | Tools | Positioning | Best for |
+|---------|--------|----------------|:---:|-------------|----------|
+| **Full** | `main` | Python + Paramiko | 15 | Most features | Network scan, batch commands, dir transfer |
+| **Simplified** | `lite` | Python + Paramiko | 11 | Trimmed | Merged FS ops, no scan |
+| **Fastest** | `fast` (this) | **Go 1.26** | 8 | Performance-first | Single binary, ms startup, zero deps |
+
+### Feature comparison
+
+| Capability | main | lite | fast |
+|------------|:---:|:---:|:---:|
+| `ssh_exec` command execution | ✅ | ✅ | ✅ |
+| `ssh_upload` / `ssh_download` | ✅ | ✅ | ✅ |
+| `ssh_filesystem` (list/stat/mkdir/remove) | ❌ 4 separate tools | ✅ merged | ✅ merged |
+| `ssh_scan` (network scan) | ✅ | ❌ | ❌ |
+| `ssh_exec_batch` (batch commands) | ✅ | ✅ | ❌ |
+| `ssh_upload_dir` / `ssh_download_dir` | ✅ | ✅ | ❌ |
+| `ssh_list_hosts` | ✅ | ✅ | ✅ |
+| Review modes (off/whitelist/manual/smart) | ✅ | ✅ | ✅ |
+| Defense-in-depth (injection/dangerous guard) | ✅ | ✅ | ✅ |
+| Strict host-key policy | ✅ | ✅ | ✅ |
+| Envelope contract compatibility | ✅ | ✅ | ✅ |
+| Startup latency (incl. handshake) | ~1749ms | ~1749ms | **~48ms** |
+| Deployment size | venv 58MB | venv 58MB | **single binary 10.6MB** |
+| Environment deps | Python + uv/venv | Python + uv/venv | **zero** |
+
+> Pick `main` for daily server management, `lite` for simplicity, and `fast` when startup speed and deployment size matter (CI, no Python env).
+
+---
+
 ## Why Go?
 
 | Metric | fast (Go) | Python edition |
