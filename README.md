@@ -96,6 +96,38 @@ ssh-keyscan -H myserver >> ~/.ssh/known_hosts   # 信任主机密钥（首次必
 **防御纵深**：命令注入特征与危险命令拦截在**所有模式**生效（含 off），
 危险命令仅 `allow_dangerous=True` 豁免，注入特征无豁免。
 
+## 架构
+
+```
+┌─────────────────┐     stdio      ┌──────────────────────┐
+│   MCP Client    │ ◄────────────► │  ssh-mcp (Go 1.26)   │
+│ (Claude/VSCode/ │                │  mcp-go v0.57        │
+│  Trae/Qoder/    │                │                      │
+│  Codex/Cursor)  │                └──────────┬───────────┘
+└─────────────────┘                           │
+                              ┌───────────────┼───────────────┐
+                              │               │               │
+                              ▼               ▼               ▼
+                        ┌──────────┐    ┌──────────┐    ┌──────────┐
+                        │ SSH Tools│    │  Review  │    │  Audit   │
+                        │  (8)     │    │  Engine  │    │          │
+                        │          │    │          │    │ JSON-lines│
+                        │ ssh_exec │    │ 4 modes  │    │ to disk  │
+                        │ ssh_upload│   │          │    │ (脱敏)    │
+                        │ ...      │    │ whitelist│    └──────────┘
+                        └────┬─────┘    │ manual   │
+                             │          │ smart    │
+                             │          │ off      │
+                             │          └────┬─────┘
+                             │               │
+                             ▼               ▼
+                    ┌──────────────────────────────┐
+                    │  x/crypto/ssh + pkg/sftp      │
+                    │  (key auth → password fallback│
+                    │   strict host-key policy)     │
+                    └──────────────────────────────┘
+```
+
 ## 开发与测试
 
 ```bash
