@@ -49,14 +49,14 @@ func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrit
 	written, copyErr := io.Copy(dst, src)
 	dst.Close()
 	if copyErr != nil {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, copyErr.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 
 	// 字节数校验
 	localStat, err := srcStat(localPath)
 	if err == nil && written != localStat {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorChecksumMismatch,
 			fmt.Sprintf("字节数不一致：local=%d remote=%d", localStat, written), "ssh_upload", "", "", nil, reviewInfo)
 	}
@@ -64,29 +64,29 @@ func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrit
 	// SHA-256 校验
 	localDigest, err := sshclient.Sha256File(localPath)
 	if err != nil {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorLocalIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	remoteFile, err := sftpClient.Open(tmp)
 	if err != nil {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	remoteData, readErr := io.ReadAll(remoteFile)
 	remoteFile.Close()
 	if readErr != nil {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, readErr.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	remoteDigest := sshclient.Sha256Bytes(remoteData)
 	if localDigest != remoteDigest {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorChecksumMismatch, "SHA-256 校验不一致", "ssh_upload", "", "", nil, reviewInfo)
 	}
 
 	// 原子重命名
 	if err := sftpClient.Rename(tmp, remotePath); err != nil {
-		sftpClient.Remove(tmp)
+		cleanupRemove(sftpClient, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 
@@ -276,6 +276,11 @@ func srcStat(path string) (int64, error) {
 		return 0, err
 	}
 	return fi.Size(), nil
+}
+
+// cleanupRemove 尽力清理临时远端文件（失败不阻断主流程）。
+func cleanupRemove(s *sftp.Client, remote string) {
+	_ = s.Remove(remote)
 }
 
 var _ = strconv.Itoa

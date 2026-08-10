@@ -344,6 +344,7 @@ func sshDir() string {
 }
 
 // intParam 提取 int 参数（args 为 mcp-go 的 map[string]any）。
+// mcp-go 传入的元素可能是 float64（JSON 解码）或 int（直接构造），两者都支持。
 func intParam(args any, key string, def int) int {
 	m, ok := args.(map[string]interface{})
 	if !ok {
@@ -352,6 +353,10 @@ func intParam(args any, key string, def int) int {
 	if v, ok := m[key]; ok {
 		switch t := v.(type) {
 		case float64:
+			return int(t)
+		case int:
+			return t
+		case int64:
 			return int(t)
 		case json.Number:
 			if n, err := strconv.Atoi(t.String()); err == nil {
@@ -392,11 +397,6 @@ func boolParam(args any, key string, def bool) bool {
 		}
 	}
 	return def
-}
-
-// requireHost 校验 host 参数。
-func requireHost(args any) string {
-	return strParam(args, "host", "")
 }
 
 var _ = context.Background

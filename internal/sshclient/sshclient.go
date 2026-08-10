@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,11 +94,13 @@ func knownHostsPaths() []string {
 // LoadKnownHosts 加载可信主机密钥集合。
 func LoadKnownHosts() (map[string]ssh.PublicKey, error) {
 	keys := map[string]ssh.PublicKey{}
+	loaded := false
 	for _, p := range knownHostsPaths() {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue
 		}
+		loaded = true
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
@@ -112,8 +115,12 @@ func LoadKnownHosts() (map[string]ssh.PublicKey, error) {
 				keys[h] = pubKey
 			}
 		}
+		// SSH_KNOWN_HOSTS 显式指定时只信任该来源（测试/自定义场景隔离）
+		if os.Getenv("SSH_KNOWN_HOSTS") != "" {
+			break
+		}
 	}
-	if len(keys) == 0 {
+	if !loaded || len(keys) == 0 {
 		return nil, fmt.Errorf("没有可用的 known_hosts 可信来源：请配置 SSH_KNOWN_HOSTS 或系统 ~/.ssh/known_hosts 后重试，禁止自动信任未知主机密钥。")
 	}
 	return keys, nil
@@ -175,7 +182,9 @@ func ResolveHost(hostSpec string) (string, string, int) {
 	}
 	if h, p, err := net.SplitHostPort(host); err == nil {
 		host = h
-		fmt.Sscanf(p, "%d", &port)
+		if n, perr := strconv.Atoi(p); perr == nil && n > 0 {
+			port = n
+		}
 	}
 
 	// ~/.ssh/config 别名覆盖
@@ -239,7 +248,9 @@ func sshConfigFor(alias string) *configEntry {
 		case "hostname":
 			entry.HostName = value
 		case "port":
-			fmt.Sscanf(value, "%d", &entry.Port)
+			if n, perr := strconv.Atoi(value); perr == nil && n > 0 {
+				entry.Port = n
+			}
 		case "identityfile":
 			entry.IdentityFile = expandTilde(value)
 		}

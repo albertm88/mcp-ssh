@@ -39,7 +39,9 @@ func TestFailureEnvelopeHasError(t *testing.T) {
 	env := results.MakeFailure(results.ErrorHostKeyMismatch, "bad key", "ssh_exec", "h", "", nil, nil)
 	data, _ := json.Marshal(env)
 	var m map[string]interface{}
-	json.Unmarshal(data, &m)
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := m["error"]; !ok {
 		t.Error("failure envelope must include error")
 	}
@@ -117,5 +119,26 @@ func TestListHostsParsing(t *testing.T) {
 	entries, _ := listHosts()
 	if entries == nil {
 		t.Error("listHosts should return non-nil entries")
+	}
+}
+
+// 回归：int 参数（timeout/limit）在 mcp-go 直接构造（int 类型）与
+// JSON 解码（float64 类型）两种输入下都必须正确解析。
+func TestIntParamBothTypes(t *testing.T) {
+	if got := intParam(map[string]interface{}{"timeout": 0}, "timeout", 30); got != 0 {
+		t.Errorf("int literal: got %d, want 0", got)
+	}
+	if got := intParam(map[string]interface{}{"timeout": float64(5)}, "timeout", 30); got != 5 {
+		t.Errorf("float64: got %d, want 5", got)
+	}
+	if got := intParam(map[string]interface{}{"timeout": int64(7)}, "timeout", 30); got != 7 {
+		t.Errorf("int64: got %d, want 7", got)
+	}
+	if got := intParam(map[string]interface{}{"timeout": "9"}, "timeout", 30); got != 9 {
+		t.Errorf("string: got %d, want 9", got)
+	}
+	// 缺失 → 默认
+	if got := intParam(map[string]interface{}{}, "timeout", 30); got != 30 {
+		t.Errorf("missing: got %d, want default 30", got)
 	}
 }

@@ -65,7 +65,3 @@ func TestKnownHostsPath(t *testing.T) {
 		t.Errorf("knownHostsPaths = %v", paths)
 	}
 }
-
-func stringsHasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}

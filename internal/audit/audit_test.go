@@ -48,7 +48,7 @@ func TestAppendAndQuery(t *testing.T) {
 	}
 
 	// 全部
-	recs, total, _ = Query(QueryOptions{Limit: 10})
+	_, total, _ = Query(QueryOptions{Limit: 10})
 	if total != 2 {
 		t.Errorf("total = %d, want 2", total)
 	}
@@ -58,7 +58,9 @@ func TestQueryLimit(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SSH_LOG_FILE", filepath.Join(dir, "a.jsonl"))
 	for i := 0; i < 5; i++ {
-		Append(Record{Host: "h", Tool: "ssh_exec"})
+		if err := Append(Record{Host: "h", Tool: "ssh_exec"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	recs, total, _ := Query(QueryOptions{Limit: 2})
 	if len(recs) != 2 || total != 5 {
