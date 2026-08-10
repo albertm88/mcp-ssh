@@ -464,9 +464,10 @@ class ManualReviewer(BaseReviewer):
 
             result = mcp_ctx.elicit(
                 message=(
-                    "[manual 审核] 工具=%s host=%s 命令=%s 路径=%s 危险等级=%s plan_id=%s"
-                    % (ctx.tool, ctx.host or "-", ctx.command[:200], ctx.path or "-",
-                       "high" if ctx.allow_dangerous else "normal", ctx.plan_id)
+                    "[manual 审核] 工具={} host={} 命令={} 路径={} 危险等级={} plan_id={}".format(
+                        ctx.tool, ctx.host or "-", ctx.command[:200], ctx.path or "-",
+                        "high" if ctx.allow_dangerous else "normal", ctx.plan_id,
+                    )
                 ),
                 schema=ManualDecision,
             )

@@ -10,9 +10,9 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
-import hashlib
 import pathlib
 import platform
 import re
@@ -21,7 +21,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import paramiko
 from charset_normalizer import from_bytes
@@ -38,8 +38,8 @@ from logger import get_logger
 from results import (
     ERROR_AUTH_FAILED,
     ERROR_CHECKSUM_MISMATCH,
-    ERROR_CONNECTION_LOST,
     ERROR_CONNECT_TIMEOUT,
+    ERROR_CONNECTION_LOST,
     ERROR_EXEC_TIMEOUT,
     ERROR_HOST_KEY_MISMATCH,
     ERROR_INVALID_ARGUMENT,
@@ -56,7 +56,12 @@ from results import (
     make_rejected,
     make_success,
 )
-from review import ReviewContext, ReviewResult, build_environment_plan, get_review_engine
+from review import (
+    ReviewContext,
+    ReviewResult,
+    build_environment_plan,
+    get_review_engine,
+)
 
 mcp = FastMCP("ssh")
 _log = get_logger()
@@ -213,7 +218,7 @@ def _tool_boundary(tool_name: str):
                 return make_failure(
                     ERROR_AUTH_FAILED, str(e), tool=tool_name,
                 ).to_dict()
-            except (socket.timeout, OSError) as e:
+            except OSError as e:
                 _log.error("tool_boundary_io", tool=tool_name, error=str(e))
                 return make_failure(
                     ERROR_CONNECTION_LOST, str(e), tool=tool_name,
@@ -272,7 +277,7 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
     try:
         sock.connect((hostname, port))
         _log.debug("tcp_probe_ok", host=host, hostname=hostname, port=port)
-    except socket.timeout:
+    except TimeoutError:
         _log.warning("tcp_probe_timeout", host=host, hostname=hostname, port=port, timeout=timeout)
         raise RuntimeError(
             f"主机不可达：{hostname}:{port} 连接超时（{timeout}s），"
@@ -377,7 +382,8 @@ def _connect(host: str, timeout: float = 10.0) -> paramiko.SSHClient:
             if isinstance(e, paramiko.AuthenticationException):
                 _log.warning("auth_failed", host=host, hostname=hostname, port=port,
                               username=username, reason="bad_password")
-                raise RuntimeError(
+                # 故意用 RuntimeError 统一错误通道（非类型错误语义）
+                raise RuntimeError(  # noqa: TRY004
                     f"认证失败：{username}@{hostname}:{port} — 密码错误。"
                     f"请检查环境变量 SSH_PASS_{host.upper().replace('.', '_').replace('-', '_')}。"
                 )
@@ -409,7 +415,7 @@ def _decode_output(raw: bytes) -> str:
         result = from_bytes(raw).best()
         if result:
             return str(result)
-    except Exception:
+    except Exception:  # noqa: S110 — 编码检测失败回退 UTF-8，容错设计
         pass
     return raw.decode("utf-8", errors="replace")
 
@@ -485,8 +491,8 @@ def _validate_command(
     allow_dangerous: bool = False,
     host: str = "",
     tool: str = "ssh_exec",
-    shell: Optional[str] = None,
-    environment: Optional[dict[str, str]] = None,
+    shell: str | None = None,
+    environment: dict[str, str] | None = None,
     ctx: Any = None,
 ) -> tuple[ReviewContext, ReviewResult]:
     """命令安全校验：委托审核引擎进行多模式审核。
@@ -526,7 +532,7 @@ def _validate_command(
     return ctx_obj, result
 
 
-def _normalize_command(command: str, shell: Optional[str] = None) -> str:
+def _normalize_command(command: str, shell: str | None = None) -> str:
     """跨平台命令标准化：自动适配不同系统的 shell 和换行符。"""
     command = command.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -603,7 +609,7 @@ def _sftp_put_atomic(
             raise ChecksumMismatchError("SHA-256 校验不一致")
         try:
             sftp.posix_rename(tmp_remote, remote)
-        except (IOError, OSError):
+        except OSError:
             sftp.rename(tmp_remote, remote)
         return {
             "bytes": local_size,
@@ -614,7 +620,7 @@ def _sftp_put_atomic(
     except Exception:
         try:
             sftp.remove(tmp_remote)
-        except (IOError, OSError):
+        except OSError:
             _log.warning("sftp_tmp_cleanup_failed", remote=tmp_remote)
         raise
 
@@ -735,9 +741,9 @@ def ssh_exec(
     host: str,
     command: str,
     timeout: float = 30,
-    shell: Optional[str] = None,
+    shell: str | None = None,
     allow_dangerous: bool = False,
-    environment: Optional[dict[str, str]] = None,
+    environment: dict[str, str] | None = None,
 ) -> dict:
     """在远程主机上执行一条 shell 命令并返回结果。"""
     request_id = uuid.uuid4().hex
@@ -831,7 +837,7 @@ def ssh_exec(
             request_id=request_id, review=_review_summary(review_result),
             duration_ms=int((time.monotonic() - t0) * 1000),
         ).to_dict()
-    except (socket.timeout, OSError) as e:
+    except OSError as e:
         _log.error(
             "ssh_exec_connection_lost", host=host, command_length=len(command),
             plan_id=plan_ctx.plan_id, elapsed=round(time.monotonic() - t0, 3),
@@ -955,7 +961,7 @@ def ssh_list_hosts() -> dict:
             ).to_dict()
     hosts: list[str] = []
     host_configs: dict[str, dict[str, str]] = {}
-    current_host: Optional[str] = None
+    current_host: str | None = None
     with cfg_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1094,7 +1100,7 @@ def ssh_upload(host: str, local_path: str, remote_path: str, timeout: int = 60, 
             ERROR_CHECKSUM_MISMATCH, str(e), tool="ssh_upload", host=host,
             review=_review_summary(review_result),
         ).to_dict()
-    except (IOError, OSError) as e:
+    except OSError as e:
         _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
                     error=str(e), plan_id=ctx.plan_id)
         return make_failure(
@@ -1207,7 +1213,7 @@ def ssh_download(host: str, remote_path: str, local_path: str, timeout: int = 60
             ERROR_INVALID_ARGUMENT, str(e), tool="ssh_download", host=host,
             review=_review_summary(review_result),
         ).to_dict()
-    except (IOError, OSError) as e:
+    except OSError as e:
         _log.error("ssh_download_failed", host=host, remote_path=remote_path,
                     local_path=str(local), error=str(e), plan_id=ctx.plan_id)
         return make_failure(
@@ -1665,7 +1671,7 @@ def ssh_upload_dir(host: str, local_dir: str, remote_dir: str, overwrite: bool =
                 _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
                             error=str(e), plan_id=plan_ctx.plan_id)
                 break
-            except (IOError, OSError) as e:
+            except OSError as e:
                 failed.append({"path": str(rel), "reason": str(e)})
                 _log.error("sftp_atomic_write_failed", host=host, remote=remote_path,
                             error=str(e), plan_id=plan_ctx.plan_id)
@@ -1805,7 +1811,7 @@ def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive
                 _log.error("sftp_atomic_write_failed", host=host, remote=remote_item,
                             error=str(e), plan_id=plan_ctx.plan_id)
                 break
-            except (IOError, OSError) as e:
+            except OSError as e:
                 failed.append({"path": str(rel), "reason": str(e)})
                 _log.error("sftp_atomic_write_failed", host=host, remote=remote_item,
                             error=str(e), plan_id=plan_ctx.plan_id)
@@ -1924,8 +1930,8 @@ def ssh_set_review_mode(
 @_tool_boundary("ssh_get_audit_logs")
 def ssh_get_audit_logs(
     limit: int = 50,
-    host: Optional[str] = None,
-    tool: Optional[str] = None,
+    host: str | None = None,
+    tool: str | None = None,
     since_minutes: int = 0,
 ) -> dict:
     """查询最近的行为日志（只读，供 AI 分析）。

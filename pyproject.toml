@@ -27,3 +27,8 @@ py-modules = [
 dev = [
     "pytest>=8.0.0",
 ]
+
+[tool.ruff.lint]
+# BLE001: 工具边界兜底捕获（防止未捕获异常导致 MCP 进程崩溃）是刻意设计，
+# 各工具 handler 内已用精确异常映射（TimeoutError/AuthenticationException/OSError 等）。
+ignore = ["BLE001"]
