@@ -1,12 +1,19 @@
 # mcp-ssh
 
-**轻量级跨平台 SSH MCP 服务器** — 让 AI 助手安全地管理远程服务器。
+**跨平台 SSH MCP 服务器** — 让 AI 助手安全地管理远程服务器。
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
 
-- **版本**：1.0.0（2026-08-09 正式版）
+> **📦 当前文档为 `main` 分支（完整版）**
+>
+> | 版本 | 分支 | 说明 |
+> |------|------|------|
+> | **main（当前）** | `main` | **完整版**：15 个 MCP 工具（含 `ssh_scan` 网络扫描、独立文件工具），含质量与安全加固 |
+> | 简化版 | `lite` | 11 个 MCP 工具，文件类操作合并为 `ssh_filesystem`，移除 `ssh_scan` |
+
+- **版本**：1.0.1（2026-08-10，质量与安全加固）
 - **平台**：Windows、Linux（含 WSL2）。macOS 不支持
 - **语言**：[English](README_EN.md) | 简体中文
 

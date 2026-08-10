@@ -1,12 +1,19 @@
 # mcp-ssh
 
-**Lightweight cross-platform SSH MCP server** — let AI assistants safely manage remote servers.
+**Cross-platform SSH MCP server** — let AI assistants safely manage remote servers.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
 
-- **Version**: 1.0.0 (2026-08-09 release)
+> **📦 This document is for the `main` branch (full edition)**
+>
+> | Edition | Branch | Description |
+> |---------|--------|-------------|
+> | **main (current)** | `main` | **Full edition**: 15 MCP tools (incl. `ssh_scan` subnet scan, separate FS tools), with quality & security hardening |
+> | Simplified | `lite` | 11 MCP tools, FS ops merged into `ssh_filesystem`, `ssh_scan` removed |
+
+- **Version**: 1.0.1 (2026-08-10, quality & security hardening)
 - **Platforms**: Windows, Linux (incl. WSL2). macOS is **not** supported
 - **Language**: English | [简体中文](README.md)
 
