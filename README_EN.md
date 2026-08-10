@@ -1,404 +1,40 @@
 # mcp-ssh
 
-**Lightweight Cross-Platform SSH MCP Server** — Let AI assistants securely manage remote servers.
+**Lightweight cross-platform SSH MCP server** — let AI assistants safely manage remote servers.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
 
-[English](README_EN.md) | [简体中文](README.md)
+- **Version**: 1.0.0 (2026-08-09 release)
+- **Platforms**: Windows, Linux (incl. WSL2). macOS is **not** supported
+- **Language**: English | [简体中文](README.md)
 
 ---
 
-## Setup Guide (Step by Step)
+## Quick Start (5 minutes)
 
-### Step 1: Install Python and uv
+### 1. Install dependencies
 
-**Windows**:
-```powershell
-# Install Python 3.10+ (download from python.org, check "Add to PATH")
-# Install uv (Python package manager)
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/):
+
+```bash
+# Windows
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# Verify
-python --version    # Should show 3.10.x or higher
-uv --version        # Should show 0.5.x or higher
-```
-
-**macOS / Linux**:
-```bash
-# Install uv
+# Linux / macOS
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Verify
-python3 --version   # Should show 3.10.x or higher
-uv --version
 ```
 
-> **Why uv?** 10-100x faster than pip, auto-creates virtualenv, avoids dependency conflicts.
-
----
-
-### Step 2: Get the Code
+### 2. Get the code and install
 
 ```bash
-# Option 1: Git clone (recommended)
 git clone https://github.com/albertm88/mcp-ssh.git
 cd mcp-ssh
-
-# Option 2: Download ZIP
-# Download ZIP from GitHub, extract and enter directory
+uv sync        # create venv and install dependencies
 ```
 
----
-
-### Step 3: Install Dependencies
-
-```bash
-# Use uv to auto-create virtualenv and install dependencies
-uv sync
-
-# Verify installation (should show mcp-ssh related packages)
-uv pip list | grep -E "mcp|paramiko"
-```
-
-**Common Issues**:
-- `uv: command not found` → Restart terminal, or manually add uv to PATH
-- `python not found` → When installing Python on Windows, check "Add Python to PATH"
-- Permission errors → Add `sudo` on Linux/macOS, or check directory permissions
-
----
-
-### Step 4: Configure SSH Connection
-
-#### 4.1 Generate SSH Key (if none)
-
-```bash
-# Linux/macOS
-ssh-keygen -t ed25519 -C "your_email@example.com"
-
-# Windows PowerShell
-ssh-keygen -t ed25519 -C "your_email@example.com"
-# Key saved to C:\Users\<username>\.ssh\id_ed25519
-```
-
-#### 4.2 Configure SSH Hosts (`~/.ssh/config`)
-
-**File path**:
-- Linux/macOS: `~/.ssh/config`
-- Windows: `C:\Users\<username>\.ssh\config`
-
-**Example configuration**:
-```ssh-config
-# Host alias: myserver (customizable)
-Host myserver
-    HostName 192.168.1.100      # Server IP or domain
-    User ubuntu                  # SSH username
-    Port 22                      # SSH port (default 22)
-    IdentityFile ~/.ssh/id_ed25519  # Private key path
-    ServerAliveInterval 60       # Keep-alive (optional)
-
-# Another server: production
-Host prod-web
-    HostName 203.0.113.10
-    User admin
-    Port 2222
-    IdentityFile ~/.ssh/id_rsa_prod
-```
-
-**Verify SSH connection**:
-```bash
-# Test if alias works
-ssh myserver "echo 'SSH connection successful'"
-
-# If fails, check:
-# 1. Server is online: ping 192.168.1.100
-# 2. Port is open: telnet 192.168.1.100 22
-# 3. Key permissions: chmod 600 ~/.ssh/id_ed25519 (Linux/macOS)
-```
-
-#### 4.3 Password Authentication (Fallback, Not Recommended)
-
-If key auth is unavailable, set password environment variables:
-
-```bash
-# Linux/macOS (temporary)
-export SSH_PASS_MYSERVER="your-password"
-
-# Linux/macOS (permanent, add to ~/.bashrc or ~/.zshrc)
-echo 'export SSH_PASS_MYSERVER="your-password"' >> ~/.bashrc
-
-# Windows PowerShell (temporary)
-$env:SSH_PASS_MYSERVER = "your-password"
-
-# Windows (permanent, system environment variables)
-# Settings → System → About → Advanced system settings → Environment Variables → New
-# Variable name: SSH_PASS_MYSERVER
-# Variable value: your-password
-```
-
-> **Naming rule**: `SSH_PASS_` + host alias (uppercase, dots/hyphens to underscores)
-> - `myserver` → `SSH_PASS_MYSERVER`
-> - `prod-web` → `SSH_PASS_PROD_WEB`
-> - `192.168.1.100` → `SSH_PASS_192_168_1_100`
-
----
-
-### Step 5: Configure MCP Client
-
-#### 5.1 Claude Code (Recommended)
-
-```bash
-# Run in project directory
-claude mcp add ssh -- uv run --directory $(pwd) python server.py
-
-# Verify configuration
-claude mcp list
-# Should show: ssh: uv run --directory /path/to/mcp-ssh python server.py
-```
-
-#### 5.2 VS Code / Cursor
-
-Edit MCP configuration file:
-
-**Path**:
-- VS Code: `~/.vscode/mcp.json` or workspace `.vscode/mcp.json`
-- Cursor: `~/.cursor/mcp.json`
-
-**Configuration**:
-```json
-{
-  "mcpServers": {
-    "ssh": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/absolute/path/to/mcp-ssh",
-        "python",
-        "server.py"
-      ],
-      "env": {
-        "SSH_REVIEW_MODE": "whitelist"
-      }
-    }
-  }
-}
-```
-
-> **Note**: On Windows, use `\\` or `/` in paths, e.g., `D:/mcp-ssh` or `D:\\mcp-ssh`
-
-#### 5.3 Trae / Qoder / Codex
-
-These clients usually auto-discover MCP configuration, or refer to their respective MCP setup docs.
-
-**General principle**:
-1. Find the client's MCP config file (usually JSON)
-2. Add `ssh` server configuration (same format as VS Code)
-3. Restart client to apply
-
----
-
-### Step 6: Verify Installation
-
-#### 6.1 Test MCP Server
-
-```bash
-# Run server directly (should show MCP protocol handshake)
-uv run python server.py
-
-# Press Ctrl+C to exit
-```
-
-#### 6.2 Test in AI Client
-
-**Claude Code**:
-```
-Please use ssh_list_hosts to view configured hosts
-```
-
-**Expected response**:
-```
-Configured host aliases:
-  myserver → ubuntu@192.168.1.100:22
-  prod-web → admin@203.0.113.10:2222
-```
-
-**If fails**:
-1. Check if MCP config path is correct
-2. Check if `uv` is in PATH
-3. Check client logs (Claude Code: `claude --debug`)
-
----
-
-### Step 7: First Use Recommendations
-
-```bash
-# 1. Test simple commands (whitelist mode allows by default)
-ssh_exec("myserver", "whoami")
-ssh_exec("myserver", "df -h")
-
-# 2. Test file upload (create a test file)
-echo "test" > test.txt
-ssh_upload("myserver", "test.txt", "/tmp/test.txt")
-
-# 3. Test review mode switching
-ssh_set_review_mode("smart")   # Smart mode
-ssh_exec("myserver", "ls -la") # Auto-approved
-```
-
----
-
-### Troubleshooting Quick Reference
-
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| `uv: command not found` | uv not installed or not in PATH | Reinstall uv, restart terminal |
-| `python: command not found` | Python not installed or not in PATH | Install Python 3.10+, check "Add to PATH" |
-| `No module named 'mcp'` | Dependencies not installed | Run `uv sync` |
-| `Connection refused` | SSH service not running | Check remote `sudo systemctl status ssh` |
-| `Permission denied` | Wrong key/password | Debug with `ssh -v myserver` |
-| `command not found` (remote) | Remote missing command | Use different command, or install on remote |
-| Chinese mojibake | Encoding mismatch | Auto-handled, if persists check remote `locale` |
-| MCP client no response | Server not started | Check client logs, manually run `uv run python server.py` |
-
----
-
-### Next Steps
-
-- Read [Core Features](#core-features) to learn all tools
-- Read [Security Mechanism](#security-mechanism-four-mode-review) to configure review policies
-- Check [FAQ](#faq) to solve common problems
-
----
-
-## Architecture
-
-```
-┌─────────────────┐     stdio      ┌─────────────┐
-│   MCP Client    │ ◄────────────► │  mcp-ssh    │
-│ (Claude/VSCode/ │                │   Server    │
-│  Trae/Qoder/    │                │             │
-│  Codex/Cursor)  │                │             │
-└─────────────────┘                └──────┬──────┘
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    │                     │                     │
-                    ▼                     ▼                     ▼
-              ┌──────────┐        ┌──────────┐          ┌──────────┐
-              │ SSH Tools│        │  Review  │          │  Logger  │
-              │          │        │  Engine  │          │          │
-              │ ssh_exec │        │          │          │ JSON-lines│
-              │ ssh_scan │        │ 4 modes  │          │ to disk  │
-              │ ssh_upload│       │          │          │          │
-              │ ...      │        │ whitelist│          │          │
-              └────┬─────┘        │ manual   │          └──────────┘
-                   │              │ smart    │
-                   │              │ off      │
-                   │              └────┬─────┘
-                   │                   │
-                   ▼                   ▼
-            ┌─────────────────────────────────┐
-            │      Paramiko SSH Client        │
-            │  (key auth → password fallback) │
-            └─────────────────────────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   Remote    │
-                    │   Servers   │
-                    └─────────────┘
-```
-
-**Data flow**: AI request → MCP protocol → Review engine → SSH execution → Log recording → Return result
-
----
-
-## Core Features
-
-| Feature | Tool | Example |
-|---------|------|---------|
-| **Execute Command** | `ssh_exec` | `ssh_exec("myserver", "df -h")` |
-| **Batch Execute** | `ssh_exec_batch` | `ssh_exec_batch("myserver", ["df -h", "free -h"])` |
-| **Upload File** | `ssh_upload` | `ssh_upload("myserver", "local.txt", "/remote/")` |
-| **Download File** | `ssh_download` | `ssh_download("myserver", "/remote/log.txt", "local.txt")` |
-| **Scan Hosts** | `ssh_scan` | `ssh_scan("192.168.1.0/24")` |
-| **Directory Ops** | `ssh_list_dir` / `ssh_mkdir` / `ssh_remove` | Manage remote directories |
-| **Behavior Log Query** | `ssh_get_audit_logs` | `ssh_get_audit_logs(limit=50, host="myserver")` |
-
-> `host` supports aliases from `~/.ssh/config`, or `user@ip` format.
-
-### Behavior Log Query
-
-`ssh_get_audit_logs` lets AI analyze recent behavior logs (read-only, no SSH side effects):
-
-```python
-# Latest 50 behavior logs
-ssh_get_audit_logs()
-
-# Filter by host / tool / time window
-ssh_get_audit_logs(host="myserver", tool="ssh_exec", since_minutes=60)
-
-# Cap result count (max 500)
-ssh_get_audit_logs(limit=200)
-```
-
-Each record contains: `timestamp`, `host` (target alias), `username` (login user), `tool` (behavior function), `args` (arguments, redacted), `status` (succeeded/failed/rejected/unknown), `duration_ms`.
-
-- Log file defaults to `~/.ssh/mcp-ssh.log` (override with `SSH_LOG_FILE`).
-- Values of `export K=V` in `args` are redacted to `***`; no passwords/private keys/env values.
-- `username` is `null` when no connection record; `status` is `unknown` when no result envelope.
-- A single `args` over 500 chars is truncated with `_truncated`; total output capped at 200KB.
-
-
----
-
-## Security Mechanism (Four-Mode Review)
-
-Default **whitelist** mode, only allows safe commands. Supports runtime switching:
-
-| Mode | Behavior | Scenario |
-|------|----------|----------|
-| `off` | Approve all | Development/debugging |
-| `whitelist` | Whitelist only | **Production (default)** |
-| `manual` | Manual confirmation per command | Critical servers |
-| `smart` | Smart judgment, uncertain→manual | Daily operations |
-
-```python
-# View current mode
-ssh_get_review_mode()
-
-# Switch mode (works out of the box, no extra configuration needed)
-ssh_set_review_mode("smart")
-```
-
-### Manual Mode Multi-Channel Confirmation
-
-In `manual` mode, each command requests human confirmation, **auto-selecting the channel by client capability**:
-
-| Channel | Trigger | Interaction |
-|---------|---------|-------------|
-| **MCP Elicitation dialog** | Client declares `elicitation` capability (VS Code / Claude Code / Claude Desktop / Trae) | IDE shows a confirm dialog describing the command, user picks `allow`/`reject` |
-| **Local terminal** | Running server directly in terminal (stdin is a tty) | Type `y/yes` approve / `n/no` reject |
-| **Reject (fail-closed)** | Neither available (e.g. LM Studio / llama.cpp without elicit) | Command rejected, prompt to switch smart/whitelist |
-
-Override with `SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` (default `auto`).
-
-### Custom Whitelist
-
-Edit `~/.ssh/mcp-ssh-whitelist.conf` (or project `whitelist.conf` template):
-
-```conf
-^ls\b                    # Allow ls
-^cat\s+[^|;&]+$         # Allow cat (no pipes)
-^docker\s+ps\b          # Allow docker ps
-```
-
----
-
-## Configuration
-
-### SSH Hosts (`~/.ssh/config`)
+### 3. Configure SSH (`~/.ssh/config`)
 
 ```ssh-config
 Host myserver
@@ -407,56 +43,146 @@ Host myserver
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-### Password Authentication (Optional)
-
 ```bash
-# Linux/macOS
-export SSH_PASS_MYSERVER="password"
-
-# Windows PowerShell
-$env:SSH_PASS_MYSERVER = "password"
+ssh myserver "echo ok"          # verify SSH works first
+ssh-keyscan -H myserver >> ~/.ssh/known_hosts   # trust host key (required once)
 ```
 
-### Environment Variables
+> Password auth: set env `SSH_PASS_MYSERVER` (alias uppercased, dots/dashes → underscores).
+> Unknown host keys are **rejected by default**; untrusted hosts fail with `HOST_KEY_MISMATCH`.
+
+### 4. Configure the MCP client (generic format)
+
+All MCP clients (Claude Desktop, VS Code, Cursor, Trae, Qoder, Codex, etc.) use the **same JSON block** — only the config file location differs:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/mcp-ssh", "python", "server.py"],
+      "env": { "SSH_REVIEW_MODE": "whitelist" }
+    }
+  }
+}
+```
+
+Add this block to your client's MCP config:
+
+| Client | Config file |
+|--------|-------------|
+| Claude Desktop | `claude_desktop_config.json` (open from app settings) |
+| VS Code | workspace `.vscode/mcp.json` or user `mcp.json` |
+| Cursor | `.cursor/mcp.json` |
+| Claude Code / Codex CLI | `claude mcp add ssh -- uv run --directory $(pwd) python server.py` |
+| Others | Add the same JSON block in the client's MCP settings |
+
+> **Windows note**: use `/` or `\\` in paths, e.g. `D:/mcp-ssh`. Restart the client after configuring.
+
+### 5. Verify installation
+
+```bash
+# One-shot verification (env, deps, SSH config, MCP handshake, live call)
+uv run python scripts/verify-install.py myserver
+```
+
+Expected output (all PASS):
+
+```
+[1/5] Environment        Python / uv
+[2/5] Dependencies       mcp / paramiko / charset_normalizer
+[3/5] SSH config         config exists, host aliases, known_hosts
+[4/5] MCP protocol       tools/list → 15 tools
+[5/5] Live call          ssh_exec(myserver, hostname) → success
+Result: 12/12 PASS
+```
+
+Test in your AI client: **"Use ssh_list_hosts to list configured hosts, then ssh_exec hostname"**
+
+---
+
+## Tools (15)
+
+| Category | Tools | Description |
+|----------|-------|-------------|
+| Command | `ssh_exec` / `ssh_exec_batch` | Run single / batch commands |
+| Discovery | `ssh_list_hosts` / `ssh_scan` | List configured hosts / scan subnet |
+| Transfer | `ssh_upload` / `ssh_download` / `ssh_upload_dir` / `ssh_download_dir` | File / dir transfer (atomic + SHA-256) |
+| Remote FS | `ssh_list_dir` / `ssh_stat_file` / `ssh_mkdir` / `ssh_remove` | List / stat / create / delete |
+| Review | `ssh_get_review_mode` / `ssh_set_review_mode` | View / switch review mode |
+| Audit | `ssh_get_audit_logs` | Query recent behavior logs (read-only) |
+
+All tools return a unified envelope (`status` / `error.code` / `data` / `text`). See [result contract](docs/requirements-1.0.md#4-结构化返回结果).
+
+---
+
+## Security
+
+### Four review modes (default `whitelist`)
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `off` | Allow everything | Development |
+| `whitelist` | Only whitelisted commands | **Production (default)** |
+| `manual` | Human confirmation per command | Critical servers |
+| `smart` | Auto-judge, escalate to human | Daily ops |
+
+```python
+ssh_get_review_mode()             # view current mode
+ssh_set_review_mode("smart")      # switch mode
+```
+
+`manual` mode auto-selects the confirmation channel: client dialog (elicitation-capable IDEs) → local terminal → fail-closed reject.
+
+### Other security boundaries
+
+- **Strict host key**: unknown/mismatched fingerprints rejected before auth (`HOST_KEY_MISMATCH`)
+- **Sensitive path guard**: `/etc/passwd`, `~/.ssh/id_*` etc. blocked; `.` / `..` components rejected
+- **Resource limits**: file size / dir size / depth / scan / output quotas — enforced even in `off` mode
+- **Credential redaction**: passwords, keys, env values never logged; `export K=V` values replaced with `***`
+- **Dangerous command guard**: `rm -rf /`, `mkfs`, `shutdown` etc. require `allow_dangerous=True`
+
+---
+
+## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SSH_PASS` | - | Global password |
-| `SSH_PASS_<HOST>` | - | Per-host password |
-| `SSH_REVIEW_MODE` | `whitelist` | Review mode |
-| `SSH_REVIEW_WHITELIST_FILE` | `~/.ssh/mcp-ssh-whitelist.conf` | Whitelist file |
-| `SSH_LOG_LEVEL` | `INFO` | Log level |
+| `SSH_REVIEW_MODE` | `whitelist` | Review mode: off / whitelist / manual / smart |
+| `SSH_PASS` / `SSH_PASS_<HOST>` | - | Global / per-host password |
+| `SSH_KNOWN_HOSTS` | system known_hosts | Custom trusted host-key file |
+| `SSH_REVIEW_WHITELIST_FILE` | `~/.ssh/mcp-ssh-whitelist.conf` | Whitelist rules file |
+| `SSH_REVIEW_MANUAL_CHANNEL` | `auto` | Manual channel: elicit / local / auto |
+| `SSH_LOG_FILE` / `SSH_LOG_LEVEL` | `~/.ssh/mcp-ssh.log` / INFO | Log file and level |
 
 ---
 
-## FAQ
+## Troubleshooting
 
-**Q: Command rejected?**  
-A: Default whitelist mode. Use `ssh_set_review_mode("smart")` to switch, or add whitelist rules.
-
-**Q: Chinese mojibake?**  
-A: Auto-handled UTF-8/GBK/GB2312/Big5. If persists, check remote `locale` settings.
-
-**Q: Connection failed?**  
-A: First test manually with `ssh user@host`. Check `~/.ssh/config` format, password env var names (dots/hyphens to underscores, uppercase).
-
-**Q: How to execute dangerous commands (e.g., rm -rf)?**  
-A: `ssh_exec(host, "rm -rf /tmp/test", allow_dangerous=True)`. Or switch to `off` mode.
+| Issue | Fix |
+|-------|-----|
+| `HOST_KEY_MISMATCH` | Run `ssh-keyscan -H <host> >> ~/.ssh/known_hosts` |
+| `AUTH_FAILED` | Check key or `SSH_PASS_<HOST>` env var |
+| `CONNECTION_LOST` / `CONNECT_TIMEOUT` | Verify reachability with `ssh <host>` first |
+| Command rejected | Switch to `smart` mode or add whitelist rules |
+| MCP client unresponsive | Run `uv run python server.py` manually to see errors |
 
 ---
 
-## Project Structure
+## Project layout
 
 ```
 mcp-ssh/
-├── server.py          # MCP server (tool definitions)
-├── review.py          # Review engine (four modes)
-├── logger.py          # Logging module
-├── whitelist.conf     # Whitelist rules template
-└── pyproject.toml     # Dependencies
+├── server.py          # MCP server (15 tools)
+├── review.py          # Four-mode review engine
+├── host_keys.py       # Strict host-key verification
+├── results.py         # Unified result envelope
+├── logger.py          # Logging (redacted)
+├── scripts/
+│   ├── verify-install.py   # Cross-platform install verification
+│   └── verify-linux.sh     # Linux local-end regression
+└── tests/             # Unit / contract / boundary tests
 ```
-
----
 
 ## License
 
