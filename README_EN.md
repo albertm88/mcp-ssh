@@ -96,6 +96,38 @@ ssh-keyscan -H myserver >> ~/.ssh/known_hosts   # trust host key (required once)
 **Defense-in-depth**: injection patterns & dangerous commands enforced in **all modes** (incl. off);
 dangerous exempt only with `allow_dangerous=True`; injection never exempt.
 
+## Architecture
+
+```
+┌─────────────────┐     stdio      ┌──────────────────────┐
+│   MCP Client    │ ◄────────────► │  ssh-mcp (Go 1.26)   │
+│ (Claude/VSCode/ │                │  mcp-go v0.57        │
+│  Trae/Qoder/    │                │                      │
+│  Codex/Cursor)  │                └──────────┬───────────┘
+└─────────────────┘                           │
+                              ┌───────────────┼───────────────┐
+                              │               │               │
+                              ▼               ▼               ▼
+                        ┌──────────┐    ┌──────────┐    ┌──────────┐
+                        │ SSH Tools│    │  Review  │    │  Audit   │
+                        │  (8)     │    │  Engine  │    │          │
+                        │          │    │          │    │ JSON-lines│
+                        │ ssh_exec │    │ 4 modes  │    │ to disk  │
+                        │ ssh_upload│   │          │    │ (redacted)│
+                        │ ...      │    │ whitelist│    └──────────┘
+                        └────┬─────┘    │ manual   │
+                             │          │ smart    │
+                             │          │ off      │
+                             │          └────┬─────┘
+                             │               │
+                             ▼               ▼
+                    ┌──────────────────────────────┐
+                    │  x/crypto/ssh + pkg/sftp      │
+                    │  (key auth → password fallback│
+                    │   strict host-key policy)     │
+                    └──────────────────────────────┘
+```
+
 ## Development & testing
 
 ```bash
