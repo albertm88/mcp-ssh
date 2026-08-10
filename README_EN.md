@@ -153,6 +153,40 @@ ssh_set_review_mode("smart")      # switch mode
 
 ---
 
+## Architecture
+
+```
+┌─────────────────┐     stdio      ┌─────────────┐
+│   MCP Client    │ ◄────────────► │  mcp-ssh    │
+│ (Claude/VSCode/ │                │   Server    │
+│  Trae/Qoder/    │                │             │
+│  Codex/Cursor)  │                │             │
+└─────────────────┘                └──────┬──────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    │                     │                     │
+                    ▼                     ▼                     ▼
+              ┌──────────┐        ┌──────────┐          ┌──────────┐
+              │ SSH Tools│        │  Review  │          │  Logger  │
+              │  (11)    │        │  Engine  │          │          │
+              │          │        │          │          │ JSON-lines│
+              │ ssh_exec │        │ 4 modes  │          │ to disk  │
+              │ ssh_filesystem│    │          │          │ (redacted)│
+              │ ssh_upload│      │ whitelist│          └──────────┘
+              │ ...      │        │ manual   │
+              └────┬─────┘        │ smart    │
+                   │              │ off      │
+                   │              └────┬─────┘
+                   │                   │
+                   ▼                   ▼
+            ┌─────────────────────────────────┐
+            │      Paramiko SSH Client        │
+            │  (key auth → password fallback) │
+            └─────────────────────────────────┘
+```
+
+---
+
 ## Environment variables
 
 | Variable | Default | Description |

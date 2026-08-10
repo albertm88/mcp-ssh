@@ -153,6 +153,40 @@ ssh_set_review_mode("smart")      # 切换模式
 
 ---
 
+## 架构
+
+```
+┌─────────────────┐     stdio      ┌─────────────┐
+│   MCP Client    │ ◄────────────► │  mcp-ssh    │
+│ (Claude/VSCode/ │                │   Server    │
+│  Trae/Qoder/    │                │             │
+│  Codex/Cursor)  │                │             │
+└─────────────────┘                └──────┬──────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    │                     │                     │
+                    ▼                     ▼                     ▼
+              ┌──────────┐        ┌──────────┐          ┌──────────┐
+              │ SSH Tools│        │  Review  │          │  Logger  │
+              │  (11)    │        │  Engine  │          │          │
+              │          │        │          │          │ JSON-lines│
+              │ ssh_exec │        │ 4 modes  │          │ to disk  │
+              │ ssh_filesystem│    │          │          │ (脱敏)    │
+              │ ssh_upload│      │ whitelist│          └──────────┘
+              │ ...      │        │ manual   │
+              └────┬─────┘        │ smart    │
+                   │              │ off      │
+                   │              └────┬─────┘
+                   │                   │
+                   ▼                   ▼
+            ┌─────────────────────────────────┐
+            │      Paramiko SSH Client        │
+            │  (key auth → password fallback) │
+            └─────────────────────────────────┘
+```
+
+---
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
