@@ -12,10 +12,44 @@
 > |---------|--------|-------------|
 > | **main (current)** | `main` | **Full edition**: 15 MCP tools (incl. `ssh_scan` subnet scan, separate FS tools), with quality & security hardening |
 > | Simplified | `lite` | 11 MCP tools, FS ops merged into `ssh_filesystem`, `ssh_scan` removed |
+> | Fastest | `fast` | Go 1.26, 8 MCP tools, single binary ~10MB, ~48ms startup, zero env deps |
 
 - **Version**: 1.0.1 (2026-08-10, quality & security hardening)
 - **Platforms**: Windows, Linux (incl. WSL2). macOS is **not** supported
 - **Language**: English | [简体中文](README.md)
+
+---
+
+## Edition family (1 main + 2 branches)
+
+Three editions are maintained in parallel, sharing the same envelope contract, 4 review modes and defense-in-depth — clients can switch without breaking:
+
+| Edition | Branch | Implementation | Tools | Positioning | Best for |
+|---------|--------|----------------|:---:|-------------|----------|
+| **Full** | `main` (this) | Python + Paramiko | 15 | Most features | Network scan, batch commands, dir transfer |
+| **Simplified** | `lite` | Python + Paramiko | 11 | Trimmed | Merged FS ops, no scan |
+| **Fastest** | `fast` | Go 1.26 | 8 | Performance-first | Single binary, ms startup, zero deps |
+
+### Feature comparison
+
+| Capability | main | lite | fast |
+|------------|:---:|:---:|:---:|
+| `ssh_exec` command execution | ✅ | ✅ | ✅ |
+| `ssh_upload` / `ssh_download` | ✅ | ✅ | ✅ |
+| `ssh_filesystem` (list/stat/mkdir/remove) | ❌ 4 separate tools | ✅ merged | ✅ merged |
+| `ssh_scan` (network scan) | ✅ | ❌ | ❌ |
+| `ssh_exec_batch` (batch commands) | ✅ | ✅ | ❌ |
+| `ssh_upload_dir` / `ssh_download_dir` | ✅ | ✅ | ❌ |
+| `ssh_list_hosts` | ✅ | ✅ | ✅ |
+| Review modes (off/whitelist/manual/smart) | ✅ | ✅ | ✅ |
+| Defense-in-depth (injection/dangerous guard) | ✅ | ✅ | ✅ |
+| Strict host-key policy | ✅ | ✅ | ✅ |
+| Envelope contract compatibility | ✅ | ✅ | ✅ |
+| Startup latency (incl. handshake) | ~1749ms | ~1749ms | **~48ms** |
+| Deployment size | venv 58MB | venv 58MB | **single binary 10.6MB** |
+| Environment deps | Python + uv/venv | Python + uv/venv | **zero** |
+
+> Pick `main` for daily server management, `lite` for simplicity, and `fast` when startup speed and deployment size matter (CI, no Python env).
 
 ---
 
