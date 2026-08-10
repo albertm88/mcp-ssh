@@ -18,7 +18,6 @@ import json
 import os
 import pathlib
 import threading
-import time
 from collections import deque
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -32,7 +31,7 @@ class Level(IntEnum):
     ERROR = 40
 
     @classmethod
-    def from_env(cls, key: str = "SSH_LOG_LEVEL", default: "Level | None" = None) -> "Level":
+    def from_env(cls, key: str = "SSH_LOG_LEVEL", default: Level | None = None) -> Level:
         if default is None:
             default = cls.INFO
         name = os.getenv(key, "").upper()

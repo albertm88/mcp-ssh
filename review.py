@@ -13,17 +13,18 @@
 """
 from __future__ import annotations
 
-import os
 import hashlib
 import json
+import os
 import re
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from logger import get_logger
 
@@ -112,7 +113,7 @@ class ReviewMode(Enum):
     SMART = "smart"
 
     @classmethod
-    def from_env(cls, key: str = "SSH_REVIEW_MODE", default: "ReviewMode | None" = None) -> "ReviewMode":
+    def from_env(cls, key: str = "SSH_REVIEW_MODE", default: ReviewMode | None = None) -> ReviewMode:
         if default is None:
             default = cls.WHITELIST
         name = os.getenv(key, "").lower().strip()
@@ -153,7 +154,7 @@ class ReviewContext:
     host: str = ""  # 目标主机
     path: str = ""  # 涉及的路径（文件操作时）
     allow_dangerous: bool = False  # 是否显式允许危险操作
-    shell: Optional[str] = None
+    shell: str | None = None
     environment: tuple[str, ...] = ()  # 只记录变量名，不记录敏感值
     local_path: str = ""
     remote_path: str = ""
@@ -217,7 +218,7 @@ class ReviewContext:
 class BaseReviewer:
     """审核器基类。"""
 
-    def __init__(self, config: "ReviewConfig") -> None:
+    def __init__(self, config: ReviewConfig) -> None:
         self.config = config
 
     def review(self, ctx: ReviewContext) -> ReviewResult:
@@ -293,7 +294,7 @@ class OffReviewer(BaseReviewer):
 class WhitelistReviewer(BaseReviewer):
     """白名单审核：仅允许匹配白名单规则的命令。"""
 
-    def __init__(self, config: "ReviewConfig") -> None:
+    def __init__(self, config: ReviewConfig) -> None:
         super().__init__(config)
         self._whitelist = self._load_whitelist()
 
@@ -455,17 +456,19 @@ class ManualReviewer(BaseReviewer):
             return False
         _log.info("manual_confirm_requested", tool=ctx.tool, host=ctx.host, plan_id=ctx.plan_id)
         try:
-            from pydantic import BaseModel, Field
             from typing import Literal
+
+            from pydantic import BaseModel, Field
 
             class ManualDecision(BaseModel):
                 decision: Literal["allow", "reject"] = Field(..., description="允许执行或拒绝")
 
             result = mcp_ctx.elicit(
                 message=(
-                    "[manual 审核] 工具=%s host=%s 命令=%s 路径=%s 危险等级=%s plan_id=%s"
-                    % (ctx.tool, ctx.host or "-", ctx.command[:200], ctx.path or "-",
-                       "high" if ctx.allow_dangerous else "normal", ctx.plan_id)
+                    "[manual 审核] 工具={} host={} 命令={} 路径={} 危险等级={} plan_id={}".format(
+                        ctx.tool, ctx.host or "-", ctx.command[:200], ctx.path or "-",
+                        "high" if ctx.allow_dangerous else "normal", ctx.plan_id,
+                    )
                 ),
                 schema=ManualDecision,
             )
@@ -576,7 +579,7 @@ class ManualReviewer(BaseReviewer):
 class SmartReviewer(BaseReviewer):
     """智能审核：本地规则初筛 → 不确定时降级为人工确认。"""
 
-    def __init__(self, config: "ReviewConfig") -> None:
+    def __init__(self, config: ReviewConfig) -> None:
         super().__init__(config)
         self._whitelist_reviewer = WhitelistReviewer(config)
         self._manual_reviewer = ManualReviewer(config)
@@ -655,7 +658,7 @@ class SmartReviewer(BaseReviewer):
 class ReviewConfig:
     """审核引擎配置。"""
     mode: ReviewMode = field(default_factory=ReviewMode.from_env)
-    whitelist_file: Optional[Path] = None
+    whitelist_file: Path | None = None
     manual_timeout: int = 60
 
     def __post_init__(self) -> None:
@@ -683,7 +686,7 @@ class ReviewConfig:
 class ReviewEngine:
     """审核引擎：工厂 + 单例 + 动态切换。"""
 
-    _instance: Optional["ReviewEngine"] = None
+    _instance: ReviewEngine | None = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -701,7 +704,7 @@ class ReviewEngine:
         }
 
     @classmethod
-    def get_instance(cls) -> "ReviewEngine":
+    def get_instance(cls) -> ReviewEngine:
         """获取单例实例。"""
         if cls._instance is None:
             with cls._lock:
@@ -750,7 +753,7 @@ class ReviewEngine:
 # 便捷函数
 # ---------------------------------------------------------------------------
 
-_engine: Optional[ReviewEngine] = None
+_engine: ReviewEngine | None = None
 
 
 def get_review_engine() -> ReviewEngine:
