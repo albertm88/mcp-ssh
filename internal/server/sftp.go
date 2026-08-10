@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -319,5 +318,3 @@ func srcStat(path string) (int64, error) {
 func cleanupRemove(s sftpOps, remote string) {
 	_ = s.Remove(remote)
 }
-
-var _ = strconv.Itoa
