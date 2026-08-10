@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -206,6 +208,12 @@ func TestListHostsHandler(t *testing.T) {
 }
 
 func TestGetAuditLogsHandler(t *testing.T) {
+	// 隔离：临时日志文件，预写一条记录（CI 环境无 ~/.ssh/mcp-ssh.log）
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	t.Setenv("SSH_LOG_FILE", logPath)
+	if err := os.WriteFile(logPath, []byte("{\"timestamp\":\"2026-08-10T00:00:00Z\",\"host\":\"h\",\"tool\":\"ssh_exec\",\"status\":\"succeeded\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	res := call(t, "ssh_get_audit_logs", map[string]interface{}{"limit": 5})
 	env := parseEnvelope(t, res)
 	if env["ok"] != true {
