@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from logger import get_logger
 
@@ -53,6 +53,51 @@ def build_environment_plan(
     ).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
     return normalized, tuple(sorted(normalized)), digest
+
+
+# ---------------------------------------------------------------------------
+# manual 多通道自动适配
+# ---------------------------------------------------------------------------
+
+def _client_supports_elicitation(mcp_ctx: Any) -> bool:
+    """检测 MCP 客户端是否声明 elicit capability。"""
+    if mcp_ctx is None:
+        return False
+    try:
+        capabilities = getattr(mcp_ctx.session, "client_params", None)
+        if capabilities is None:
+            return False
+        elicitation = getattr(capabilities.capabilities, "elicitation", None)
+        return elicitation is not None
+    except Exception:
+        return False
+
+
+def _select_manual_channel(mcp_ctx: Any) -> tuple[str, str]:
+    """选择 manual 确认通道：elicit / local / reject。
+
+    返回 (channel, error_message)。
+    channel: "elicit" | "local" | "reject"
+    SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto 可显式覆盖（默认 auto）。
+    """
+    forced = os.getenv("SSH_REVIEW_MANUAL_CHANNEL", "auto").strip().lower()
+
+    if forced == "elicit":
+        if not _client_supports_elicitation(mcp_ctx):
+            return "reject", "客户端不支持 elicit 弹框（未声明 elicitation capability），无法人工确认。请切 smart/whitelist 或检查客户端。"
+        return "elicit", ""
+
+    if forced == "local":
+        if not sys.stdin.isatty():
+            return "reject", "SSH_REVIEW_MANUAL_CHANNEL=local 但当前无本地终端（stdin 非 tty）。"
+        return "local", ""
+
+    # auto：按客户端能力自动适配
+    if _client_supports_elicitation(mcp_ctx):
+        return "elicit", ""
+    if sys.stdin.isatty():
+        return "local", ""
+    return "reject", "当前客户端不支持人工确认（无 elicitation capability 且非本地终端）。请切换 smart/whitelist 模式。"
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +160,7 @@ class ReviewContext:
     recursive: bool = False
     overwrite: bool = False
     environment_digest: str = ""
+    mcp_ctx: Any = field(default=None, repr=False, compare=False)  # MCP Context（manual 弹框用）
 
     def __post_init__(self) -> None:
         string_fields = {
@@ -357,11 +403,38 @@ class ManualReviewer(BaseReviewer):
             self._log_audit(ctx, invalid)
             return invalid
 
-        # 打印待审核命令
-        self._print_review_banner(ctx)
+        # 选择确认通道（elicit / local / fail-closed）
+        channel, channel_error = _select_manual_channel(ctx.mcp_ctx)
+        client_name = ""
+        if ctx.mcp_ctx is not None:
+            sess = getattr(ctx.mcp_ctx, "session", None)
+            if sess is not None:
+                cp = getattr(sess, "client_params", None)
+                ci = getattr(cp, "clientInfo", None) if cp is not None else None
+                client_name = getattr(ci, "name", "") or ""
+        _log.info(
+            "manual_channel_fallback",
+            channel=channel,
+            error=channel_error or "",
+            client=client_name,
+        )
 
-        # 等待人工确认
-        approved = self._wait_for_confirmation(ctx)
+        if channel == "reject":
+            result = ReviewResult(
+                approved=False,
+                mode="manual",
+                reason=channel_error or "当前客户端不支持人工确认",
+                risk_level="high",
+                elapsed=time.monotonic() - t0,
+                plan_id=ctx.plan_id,
+            )
+            self._log_audit(ctx, result)
+            return result
+
+        if channel == "elicit":
+            approved = self._wait_elicitation(ctx)
+        else:
+            approved = self._wait_confirmation_local(ctx)
 
         result = ReviewResult(
             approved=approved,
@@ -373,6 +446,39 @@ class ManualReviewer(BaseReviewer):
         )
         self._log_audit(ctx, result)
         return result
+
+    def _wait_elicitation(self, ctx: ReviewContext) -> bool:
+        """经 MCP Elicitation 弹框等待人工确认。"""
+        mcp_ctx = ctx.mcp_ctx
+        if mcp_ctx is None:
+            _log.warning("manual_channel_fallback", channel="reject", error="elicit 通道但无 MCP Context")
+            return False
+        _log.info("manual_confirm_requested", tool=ctx.tool, host=ctx.host, plan_id=ctx.plan_id)
+        try:
+            from pydantic import BaseModel, Field
+            from typing import Literal
+
+            class ManualDecision(BaseModel):
+                decision: Literal["allow", "reject"] = Field(..., description="允许执行或拒绝")
+
+            result = mcp_ctx.elicit(
+                message=(
+                    "[manual 审核] 工具=%s host=%s 命令=%s 路径=%s 危险等级=%s plan_id=%s"
+                    % (ctx.tool, ctx.host or "-", ctx.command[:200], ctx.path or "-",
+                       "high" if ctx.allow_dangerous else "normal", ctx.plan_id)
+                ),
+                schema=ManualDecision,
+            )
+            approved = bool(
+                getattr(result, "action", None) == "accept"
+                and getattr(getattr(result, "data", None), "decision", None) == "allow"
+            )
+            _log.info("manual_confirm_result", tool=ctx.tool, host=ctx.host,
+                      approved=approved, action=getattr(result, "action", None))
+            return approved
+        except Exception as e:
+            _log.error("manual_confirm_elicitation_error", error=str(e))
+            return False
 
     def _safe_print(self, text: str, **kwargs) -> None:
         """跨平台安全打印，避免 Windows GBK 编码 emoji 失败。"""
@@ -409,8 +515,9 @@ class ManualReviewer(BaseReviewer):
 """.strip()
         self._safe_print(banner, file=sys.stderr, flush=True)
 
-    def _wait_for_confirmation(self, ctx: ReviewContext) -> bool:
-        """等待人工确认，支持超时。"""
+    def _wait_confirmation_local(self, ctx: ReviewContext) -> bool:
+        """本地终端等待人工确认，支持超时。"""
+        self._print_review_banner(ctx)
         # MCP stdio 独占 stdin；非交互环境必须失败关闭，不能消费协议帧。
         if not sys.stdin.isatty():
             self._safe_print(
@@ -550,7 +657,6 @@ class ReviewConfig:
     mode: ReviewMode = field(default_factory=ReviewMode.from_env)
     whitelist_file: Optional[Path] = None
     manual_timeout: int = 60
-    allow_runtime_switch: bool = False
 
     def __post_init__(self) -> None:
         # 白名单文件路径
@@ -568,10 +674,6 @@ class ReviewConfig:
                 raise ValueError("SSH_REVIEW_MANUAL_TIMEOUT 必须是整数")
         if self.manual_timeout <= 0:
             raise ValueError("manual_timeout 必须大于 0")
-
-        env_switch = os.getenv("SSH_REVIEW_ALLOW_RUNTIME_SWITCH")
-        if env_switch is not None:
-            self.allow_runtime_switch = env_switch.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -612,16 +714,18 @@ class ReviewEngine:
         reviewer = self._reviewers[self.config.mode]
         return reviewer.review(ctx)
 
-    def set_mode(self, mode: ReviewMode | str, *, authorized: bool = False) -> tuple[bool, str]:
-        """由外部管理员授权后切换审核模式。"""
+    def set_mode(self, mode: ReviewMode | str) -> tuple[bool, str]:
+        """切换审核模式（无授权门槛，由默认状态决定）。"""
         if isinstance(mode, str):
             try:
                 mode = ReviewMode(mode.lower().strip())
             except ValueError:
+                _log.warning(
+                    "review_mode_switch_rejected",
+                    mode=mode,
+                    reason="无效的审核模式",
+                )
                 return False, f"无效的审核模式: {mode}。可选: off, whitelist, manual, smart"
-
-        if not authorized:
-            return False, "运行时切换审核模式需要管理员授权"
 
         old_mode = self.config.mode
         self.config.mode = mode
@@ -639,7 +743,6 @@ class ReviewEngine:
             "whitelist_file": str(self.config.whitelist_file),
             "whitelist_exists": self.config.whitelist_file.exists() if self.config.whitelist_file else False,
             "manual_timeout": self.config.manual_timeout,
-            "runtime_switch_enabled": self.config.allow_runtime_switch,
         }
 
 

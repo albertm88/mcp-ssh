@@ -324,8 +324,32 @@ ssh_exec("myserver", "ls -la") # Auto-approved
 | **Download File** | `ssh_download` | `ssh_download("myserver", "/remote/log.txt", "local.txt")` |
 | **Scan Hosts** | `ssh_scan` | `ssh_scan("192.168.1.0/24")` |
 | **Directory Ops** | `ssh_list_dir` / `ssh_mkdir` / `ssh_remove` | Manage remote directories |
+| **Behavior Log Query** | `ssh_get_audit_logs` | `ssh_get_audit_logs(limit=50, host="myserver")` |
 
 > `host` supports aliases from `~/.ssh/config`, or `user@ip` format.
+
+### Behavior Log Query
+
+`ssh_get_audit_logs` lets AI analyze recent behavior logs (read-only, no SSH side effects):
+
+```python
+# Latest 50 behavior logs
+ssh_get_audit_logs()
+
+# Filter by host / tool / time window
+ssh_get_audit_logs(host="myserver", tool="ssh_exec", since_minutes=60)
+
+# Cap result count (max 500)
+ssh_get_audit_logs(limit=200)
+```
+
+Each record contains: `timestamp`, `host` (target alias), `username` (login user), `tool` (behavior function), `args` (arguments, redacted), `status` (succeeded/failed/rejected/unknown), `duration_ms`.
+
+- Log file defaults to `~/.ssh/mcp-ssh.log` (override with `SSH_LOG_FILE`).
+- Values of `export K=V` in `args` are redacted to `***`; no passwords/private keys/env values.
+- `username` is `null` when no connection record; `status` is `unknown` when no result envelope.
+- A single `args` over 500 chars is truncated with `_truncated`; total output capped at 200KB.
+
 
 ---
 
@@ -344,9 +368,21 @@ Default **whitelist** mode, only allows safe commands. Supports runtime switchin
 # View current mode
 ssh_get_review_mode()
 
-# Switch mode (no restart needed)
+# Switch mode (works out of the box, no extra configuration needed)
 ssh_set_review_mode("smart")
 ```
+
+### Manual Mode Multi-Channel Confirmation
+
+In `manual` mode, each command requests human confirmation, **auto-selecting the channel by client capability**:
+
+| Channel | Trigger | Interaction |
+|---------|---------|-------------|
+| **MCP Elicitation dialog** | Client declares `elicitation` capability (VS Code / Claude Code / Claude Desktop / Trae) | IDE shows a confirm dialog describing the command, user picks `allow`/`reject` |
+| **Local terminal** | Running server directly in terminal (stdin is a tty) | Type `y/yes` approve / `n/no` reject |
+| **Reject (fail-closed)** | Neither available (e.g. LM Studio / llama.cpp without elicit) | Command rejected, prompt to switch smart/whitelist |
+
+Override with `SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` (default `auto`).
 
 ### Custom Whitelist
 

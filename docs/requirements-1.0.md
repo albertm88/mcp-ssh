@@ -22,8 +22,17 @@
 | 文件 | `ssh_upload`、`ssh_download`、`ssh_upload_dir`、`ssh_download_dir` |
 | 远端文件系统 | `ssh_list_dir`、`ssh_stat_file`、`ssh_mkdir`、`ssh_remove` |
 | 审核 | `ssh_get_review_mode`、`ssh_set_review_mode` |
+| 日志查询 | `ssh_get_audit_logs` |
 
-验收：MCP `tools/list` 精确包含以上 14 个工具；旧参数调用均能通过 schema 校验。
+验收：MCP `tools/list` 精确包含以上 14 个工具 + `ssh_get_audit_logs`；旧参数调用均能通过 schema 校验。
+
+### FR-LOG 行为日志查询
+
+- [x] `ssh_get_audit_logs` 只读查询最近行为日志，返回每条含 timestamp/host/username/tool/args/status/duration_ms。
+- [x] 支持 `host` / `tool` / `since_minutes` 过滤；`limit` 默认 50、最大 500。
+- [x] `args` 中 `export K=V` 的值脱敏为 `***`，不暴露密码/私钥/环境变量值。
+- [x] 无连接记录时 `username` 为 `null`；无结果 envelope 时 `status` 为 `unknown`。
+- [x] 日志文件缺失返回稳定 `LOCAL_IO_ERROR`；单条 args 500 字符截断、总输出 200KB 上限。
 
 ### FR-02 跨平台（Windows + Linux，macOS 不支持）
 
@@ -35,7 +44,14 @@
 
 ### FR-03 四种审核模式
 
-所有可产生外部影响的工具先生成规范化操作计划，再审核，再执行。审核模式只能由服务配置或 `ssh_set_review_mode` 修改，单次工具参数不能替代审核决定。
+所有可产生外部影响的工具先生成规范化操作计划，再审核，再执行。审核模式只能由服务配置或 `ssh_set_review_mode` 修改，单次工具参数不能替代审核决定。`ssh_set_review_mode` 运行时切换开箱即用（无授权门槛），模式由默认状态决定；切换本身产生 `review_mode_changed` 审计事件，无效模式值被拒绝且状态不变。
+
+### FR-MANUAL manual 多通道人工确认
+
+- [x] manual 模式下每条命令请求人工确认，按客户端能力自动选择通道：MCP Elicitation 弹框（客户端声明 `elicitation` capability）→ 本地终端（stdin tty）→ fail-closed 拒绝。
+- [x] Elicitation 弹框描述工具/host/命令/危险等级/plan_id，用户选择 allow/reject；accept+allow → 执行，decline/cancel/异常 → 拒绝。
+- [x] `SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` env 强制覆盖（默认 auto）；强制通道不可用时明确拒绝，不静默回退。
+- [x] manual 确认全过程产生审计事件（`manual_confirm_requested`/`manual_confirm_result`/`manual_channel_fallback`）。
 
 | 模式 | 必须行为 |
 |---|---|

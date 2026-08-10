@@ -2,6 +2,21 @@
 
 All notable changes are recorded here. The project follows Semantic Versioning.
 
+## [Unreleased] - 2026-08-09（候选变更）
+
+### Added
+
+- `ssh_set_review_mode` 的 `mode` 参数增加 enum 枚举约束（`off`/`whitelist`/`manual`/`smart`），使所有 MCP 客户端能从工具 schema 看到 4 个可选审核模式（此前 `mode` 为自由字符串，客户端无法从 schema 识别 manual 等模式）。
+
+### 前序候选变更
+
+- **manual 审核多通道自动适配**：`manual` 模式按客户端能力自动选择人工确认通道——优先 MCP Elicitation 弹框（客户端声明 `elicitation` capability，VS Code/Claude Code/Claude Desktop/Trae），回退本地终端 `isatty()`，两者都不可用则 fail-closed 拒绝并提示切换模式。`SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` 可强制覆盖（默认 auto）。SSH 执行类工具注入 MCP Context 供弹框使用；新增 `manual_confirm_requested`/`manual_confirm_result`/`manual_channel_fallback` 审计事件。
+- 新增 `ssh_get_audit_logs` MCP 工具：只读查询最近行为日志（含目标机器 host、登录用户名 username、时间戳、行为函数 tool、含参内容 args、status、耗时），支持按 host/tool/since_minutes 过滤与 limit 上限；args 脱敏（`export K=V` 值 → `***`），单条 args 500 字符截断、总输出 200KB 上限；供 AI 直接分析。日志默认 `~/.ssh/mcp-ssh.log`（`SSH_LOG_FILE` 可覆盖）。
+
+### Fixed
+
+- `ssh_set_review_mode` 移除运行时切换授权门槛：`ReviewEngine.set_mode` 不再需要 `authorized` 参数，`ReviewConfig` 移除 `allow_runtime_switch` 配置项与 `SSH_REVIEW_ALLOW_RUNTIME_SWITCH` env 解析，`get_status()` 移除 `runtime_switch_enabled`。模式切换开箱即用、由默认状态决定，AI 可直接修改审核模式；无效模式值仍被拒绝且状态不变（新增 `review_mode_switch_rejected` 审计事件）。测试与文档同步更新。
+
 ## [1.0.0] - 2026-08-09（正式发布）
 
 > 本版本为 **1.0.0 正式版**，取代原 `Ver.1.0.0 Demo` 标记。参考仓库 `albertm88/mcp-ssh` 的 `Ver.1.0.0`/`Ver.0.0.1` 指向同一 commit `0e149a9`，属 demo 标记而非发布证据；本次在 `0e149a9` 基线之上完成全部交付能力并经开发者验收，正式发布 1.0.0。

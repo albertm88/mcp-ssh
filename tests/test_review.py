@@ -27,6 +27,7 @@ def review_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReviewConf
     monkeypatch.delenv("SSH_REVIEW_MODE", raising=False)
     monkeypatch.delenv("SSH_REVIEW_WHITELIST_FILE", raising=False)
     monkeypatch.delenv("SSH_REVIEW_MANUAL_TIMEOUT", raising=False)
+    monkeypatch.delenv("SSH_REVIEW_ALLOW_RUNTIME_SWITCH", raising=False)
     return ReviewConfig(
         mode=ReviewMode.WHITELIST,
         whitelist_file=tmp_path / "missing-whitelist.conf",
@@ -183,13 +184,13 @@ class TestManualMode:
     ) -> None:
         reviewer = ManualReviewer(review_config)
         calls: list[ReviewContext] = []
-        monkeypatch.setattr(reviewer, "_print_review_banner", lambda _ctx: None)
+        monkeypatch.setattr("review._select_manual_channel", lambda _ctx: ("local", ""))
 
         def confirm(ctx: ReviewContext) -> bool:
             calls.append(ctx)
             return approved
 
-        monkeypatch.setattr(reviewer, "_wait_for_confirmation", confirm)
+        monkeypatch.setattr(reviewer, "_wait_confirmation_local", confirm)
         context = make_context("service nginx restart")
 
         result = reviewer.review(context)
@@ -203,19 +204,143 @@ class TestManualMode:
     ) -> None:
         reviewer = ManualReviewer(review_config)
         calls: list[ReviewContext] = []
-        monkeypatch.setattr(reviewer, "_print_review_banner", lambda _ctx: None)
+        monkeypatch.setattr("review._select_manual_channel", lambda _ctx: ("local", ""))
 
         def reject(ctx: ReviewContext) -> bool:
             calls.append(ctx)
             return False
 
-        monkeypatch.setattr(reviewer, "_wait_for_confirmation", reject)
+        monkeypatch.setattr(reviewer, "_wait_confirmation_local", reject)
         context = make_context("rm -rf /", allow_dangerous=True)
 
         result = reviewer.review(context)
 
         assert calls == [context]
         assert result.approved is False
+
+    def test_elicitation_channel_accept(
+        self, review_config: ReviewConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """客户端声明 elicit capability 时走 elicit 弹框，accept+allow → 执行。"""
+        reviewer = ManualReviewer(review_config)
+        monkeypatch.setattr("review._select_manual_channel", lambda _ctx: ("elicit", ""))
+
+        class FakeData:
+            decision = "allow"
+
+        class FakeResult:
+            action = "accept"
+            data = FakeData()
+
+        class FakeMcpCtx:
+            def elicit(self, message, schema):
+                return FakeResult()
+
+        context = make_context("df -h")
+        context = ReviewContext(
+            tool=context.tool, command=context.command, host=context.host,
+            mcp_ctx=FakeMcpCtx(),
+        )
+        result = reviewer.review(context)
+        assert result.approved is True
+
+    def test_elicitation_channel_reject(
+        self, review_config: ReviewConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """elicit decline/cancel → 拒绝。"""
+        reviewer = ManualReviewer(review_config)
+        monkeypatch.setattr("review._select_manual_channel", lambda _ctx: ("elicit", ""))
+
+        class FakeResult:
+            action = "decline"
+            data = None
+
+        class FakeMcpCtx:
+            def elicit(self, message, schema):
+                return FakeResult()
+
+        context = make_context("rm -rf /tmp/x")
+        context = ReviewContext(
+            tool=context.tool, command=context.command, host=context.host,
+            mcp_ctx=FakeMcpCtx(),
+        )
+        result = reviewer.review(context)
+        assert result.approved is False
+
+    def test_elicitation_exception_falls_back_to_reject(
+        self, review_config: ReviewConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """elicit 抛异常（客户端未响应/超时）→ 拒绝。"""
+        reviewer = ManualReviewer(review_config)
+        monkeypatch.setattr("review._select_manual_channel", lambda _ctx: ("elicit", ""))
+
+        class FakeMcpCtx:
+            def elicit(self, message, schema):
+                raise RuntimeError("client did not respond")
+
+        context = make_context("df -h")
+        context = ReviewContext(
+            tool=context.tool, command=context.command, host=context.host,
+            mcp_ctx=FakeMcpCtx(),
+        )
+        result = reviewer.review(context)
+        assert result.approved is False
+
+    def test_fail_closed_when_no_channel(
+        self, review_config: ReviewConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """无 elicit capability 且无本地终端 → fail-closed 拒绝。"""
+        reviewer = ManualReviewer(review_config)
+        monkeypatch.setattr(
+            "review._select_manual_channel",
+            lambda _ctx: ("reject", "当前客户端不支持人工确认"),
+        )
+        result = reviewer.review(make_context("df -h"))
+        assert result.approved is False
+        assert "不支持" in result.reason
+
+    def test_select_manual_channel_auto_prefers_elicit(
+        self, review_config: ReviewConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """auto 模式下客户端声明 elicit → 选 elicit。"""
+        class FakeCaps:
+            elicitation = object()
+
+        class FakeClientParams:
+            capabilities = FakeCaps()
+
+        class FakeSession:
+            client_params = FakeClientParams()
+
+        class FakeCtx:
+            session = FakeSession()
+
+        from review import _select_manual_channel
+        channel, _err = _select_manual_channel(FakeCtx())
+        assert channel == "elicit"
+
+    def test_select_manual_channel_forced_elicit_without_capability_rejects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SSH_REVIEW_MANUAL_CHANNEL=elicit 但客户端无 capability → 拒绝（不静默回退）。"""
+        monkeypatch.setenv("SSH_REVIEW_MANUAL_CHANNEL", "elicit")
+
+        class FakeCaps:
+            elicitation = None
+
+        class FakeClientParams:
+            capabilities = FakeCaps()
+
+        class FakeSession:
+            client_params = FakeClientParams()
+
+        class FakeCtx:
+            session = FakeSession()
+
+        from review import _select_manual_channel
+        channel, err = _select_manual_channel(FakeCtx())
+        assert channel == "reject"
+        assert "elicit" in err
 
 
 class TestSmartMode:
@@ -329,7 +454,7 @@ class TestReviewEngineModeSwitching:
         engine.config = review_config
         engine._init_reviewers()
 
-        success, _message = engine.set_mode("  SMART  ", authorized=True)
+        success, _message = engine.set_mode("  SMART  ")
 
         assert success is True
         assert engine.get_mode() == "smart"
@@ -347,7 +472,7 @@ class TestReviewEngineModeSwitching:
         assert success is False
         assert engine.get_mode() == original
 
-    def test_lowering_policy_to_off_requires_authorization(
+    def test_switching_to_off_is_allowed_without_authorization(
         self, review_config: ReviewConfig
     ) -> None:
         engine = ReviewEngine()
@@ -357,8 +482,31 @@ class TestReviewEngineModeSwitching:
 
         success, _message = engine.set_mode("off")
 
-        assert success is False
-        assert engine.get_mode() == "whitelist"
+        assert success is True
+        assert engine.get_mode() == "off"
+
+    def test_set_mode_switches_between_all_valid_modes(
+        self, review_config: ReviewConfig
+    ) -> None:
+        engine = ReviewEngine()
+        engine.config = review_config
+        engine._init_reviewers()
+
+        for mode in ("off", "whitelist", "manual", "smart"):
+            success, _message = engine.set_mode(mode)
+            assert success is True
+            assert engine.get_mode() == mode
+
+    def test_get_status_has_no_runtime_switch_field(
+        self, review_config: ReviewConfig
+    ) -> None:
+        engine = ReviewEngine()
+        engine.config = review_config
+        engine._init_reviewers()
+
+        status = engine.get_status()
+
+        assert "runtime_switch_enabled" not in status
 
 
 class TestOperationPlanAndInputBoundaries:

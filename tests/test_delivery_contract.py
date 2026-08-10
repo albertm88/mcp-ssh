@@ -35,6 +35,7 @@ EXPECTED_TOOLS = frozenset({
     "ssh_remove",
     "ssh_get_review_mode",
     "ssh_set_review_mode",
+    "ssh_get_audit_logs",
 })
 
 EXPECTED_ERROR_CODES = frozenset({
@@ -109,6 +110,23 @@ class TestToolContract:
         assert list(inspect.signature(server.ssh_exec_batch).parameters) == [
             "host", "commands", "timeout", "stop_on_error",
         ]
+
+    def test_set_review_mode_has_mode_enum(self) -> None:
+        """ssh_set_review_mode 的 mode 参数必须暴露 4 个审核模式 enum。"""
+        import ast
+        import inspect
+
+        sig = inspect.signature(server.ssh_set_review_mode)
+        annotation = sig.parameters["mode"].annotation
+        # FastMCP 将 annotation 序列化为字符串，如 "Literal['off', 'whitelist', 'manual', 'smart']"
+        text = annotation if isinstance(annotation, str) else str(annotation)
+        assert "Literal" in text
+        try:
+            node = ast.parse(text, mode="eval").body
+            values = [arg.value for arg in node.slice.elts] if hasattr(node, "slice") else []
+        except Exception:
+            values = []
+        assert set(values) == {"off", "whitelist", "manual", "smart"}
 
 
 class TestEnvelope:
@@ -273,8 +291,7 @@ class FakeEngine:
             "whitelist_file": "",
             "whitelist_exists": False,
             "manual_timeout": 60,
-            "runtime_switch_enabled": False,
         }
 
-    def set_mode(self, mode: str, *, authorized: bool = False) -> tuple[bool, str]:
+    def set_mode(self, mode: str) -> tuple[bool, str]:
         return True, "ok"

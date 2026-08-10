@@ -380,8 +380,31 @@ ssh_exec("myserver", "ls -la") # 自动放行
 | **下载文件** | `ssh_download` | `ssh_download("myserver", "/remote/log.txt", "local.txt")` |
 | **扫描主机** | `ssh_scan` | `ssh_scan("192.168.1.0/24")` |
 | **目录操作** | `ssh_list_dir` / `ssh_mkdir` / `ssh_remove` | 管理远程目录 |
+| **行为日志查询** | `ssh_get_audit_logs` | `ssh_get_audit_logs(limit=50, host="myserver")` |
 
 > `host` 支持 `~/.ssh/config` 中的别名，或 `user@ip` 格式。
+
+### 行为日志查询
+
+`ssh_get_audit_logs` 供 AI 分析最近的行为日志（只读，无 SSH 副作用）：
+
+```python
+# 最近 50 条行为日志
+ssh_get_audit_logs()
+
+# 按机器/工具/时间过滤
+ssh_get_audit_logs(host="myserver", tool="ssh_exec", since_minutes=60)
+
+# 限制条数（最大 500）
+ssh_get_audit_logs(limit=200)
+```
+
+每条返回含：`timestamp`（时间戳）、`host`（目标机器别名）、`username`（登录用户名）、`tool`（行为函数）、`args`（含参内容，脱敏）、`status`（succeeded/failed/rejected/unknown）、`duration_ms`。
+
+- 日志文件默认 `~/.ssh/mcp-ssh.log`（可用 `SSH_LOG_FILE` 指定）。
+- `args` 中 `export K=V` 的值脱敏为 `***`，不含密码/私钥/环境变量值。
+- 无对应连接记录时 `username` 为 `null`；无结果 envelope 时 `status` 为 `unknown`。
+- 单条 `args` 超过 500 字符截断并标记 `_truncated`；总输出上限 200KB。
 
 ---
 
@@ -400,9 +423,21 @@ ssh_exec("myserver", "ls -la") # 自动放行
 # 查看当前模式
 ssh_get_review_mode()
 
-# 切换模式（无需重启）
+# 切换模式（开箱即用，无需额外配置）
 ssh_set_review_mode("smart")
 ```
+
+### manual 模式的多通道人工确认
+
+`manual` 模式下每条命令会请求人工确认，**按客户端自动选择确认通道**：
+
+| 通道 | 触发条件 | 交互方式 |
+|------|---------|---------|
+| **MCP Elicitation 弹框** | 客户端声明 `elicitation` capability（VS Code / Claude Code / Claude Desktop / Trae） | IDE 弹出确认框，描述命令并让用户选 `allow`/`reject` |
+| **本地终端** | 直接命令行运行 server（stdin 为 tty） | 终端 `y/yes` 批准 / `n/no` 拒绝 |
+| **拒绝（fail-closed）** | 两者都不可用（如 LM Studio / llama.cpp 等无 elicit 客户端） | 命令被拒，提示切换 smart/whitelist |
+
+可用 `SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` 环境变量强制指定通道（默认 `auto` 自动适配）。
 
 ### 自定义白名单
 
@@ -445,7 +480,10 @@ $env:SSH_PASS_MYSERVER = "password"
 | `SSH_PASS_<HOST>` | - | 单主机密码 |
 | `SSH_REVIEW_MODE` | `whitelist` | 审核模式 |
 | `SSH_REVIEW_WHITELIST_FILE` | `~/.ssh/mcp-ssh-whitelist.conf` | 白名单文件 |
+| `SSH_REVIEW_MANUAL_CHANNEL` | `auto` | manual 确认通道：`elicit`/`local`/`auto` |
 | `SSH_LOG_LEVEL` | `INFO` | 日志级别 |
+
+> **审核模式切换**：`ssh_set_review_mode("smart")` 开箱即用，无需额外配置；模式切换由默认状态决定，AI 可直接修改审核模式。
 
 ---
 

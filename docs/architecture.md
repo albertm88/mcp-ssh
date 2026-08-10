@@ -42,7 +42,8 @@ MCP tool
 - `whitelist`：匹配工具 + 主机 + shell/可执行程序 + 路径 + 操作标志的结构化规则；默认拒绝。
 - `manual`：通过独立审批通道展示完整计划；失败关闭（fail closed）。stdio 的 stdin/stdout 保留给 MCP 协议，生产审批不得直接读取协议 stdin。
 - `smart`：确定性规则先判定；智能判断只返回建议和理由；不确定/不可用转人工。
-- `ssh_set_review_mode` 本身产生审计事件；生产可配置为必须人工批准。
+- `ssh_set_review_mode` 本身产生审计事件；运行时切换**无授权门槛**，模式能否切换由默认状态决定，模型自身允许直接修改审核模式（不做过度配置）。
+- `manual` 模式采用**多通道人工确认**：优先经 MCP Elicitation 弹框（客户端声明 `elicitation` capability，如 VS Code/Claude Code/Claude Desktop/Trae）；回退本地终端 `isatty()`；两者都不可用则 fail-closed 拒绝并提示切换模式。通道由 `SSH_REVIEW_MANUAL_CHANNEL=elicit|local|auto` 控制（默认 auto）。
 
 ## 4. 跨平台边界
 
@@ -99,6 +100,7 @@ MCP tool
 - 审核控制“是否允许”；参数校验、身份验证、资源限制和数据完整性始终启用。
 - 审计日志追加写：request_id、计划摘要、审核、执行结论、耗时、流量、错误码；命令正文按策略摘要化。
 - 指标：调用数/失败率/拒绝率/超时率、审核等待、连接/命令延迟、池占用、传输字节、输出截断、资源拒绝。
+- `ssh_get_audit_logs` 只读查询最近行为日志（含 host/username/timestamp/tool/args/status），供 AI 分析；args 脱敏、输出受限（单条 500 字符、总量 200KB）。
 
 ## 8. 迁移与交付顺序
 

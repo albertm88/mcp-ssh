@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import hashlib
 import pathlib
@@ -19,7 +20,8 @@ import shlex
 import socket
 import time
 import uuid
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Literal, Optional
 
 import paramiko
 from charset_normalizer import from_bytes
@@ -462,6 +464,23 @@ def _review_context(ctx: ReviewContext) -> ReviewResult:
     return result
 
 
+def _get_mcp_ctx() -> Any:
+    """获取当前请求的 MCP Context（manual 弹框用）；非请求上下文时返回 None。"""
+    try:
+        ctx = mcp.get_context()
+        sess = getattr(ctx, "session", None)
+        cp = getattr(sess, "client_params", None) if sess is not None else None
+        caps = getattr(cp, "capabilities", None) if cp is not None else None
+        _log.info("mcp_ctx_probe",
+                  has_session=sess is not None,
+                  has_client_params=cp is not None,
+                  has_elicitation=(caps is not None and getattr(caps, "elicitation", None) is not None))
+        return ctx
+    except Exception as e:
+        _log.warning("mcp_ctx_probe_error", error=str(e))
+        return None
+
+
 def _validate_command(
     command: str,
     allow_dangerous: bool = False,
@@ -469,6 +488,7 @@ def _validate_command(
     tool: str = "ssh_exec",
     shell: Optional[str] = None,
     environment: Optional[dict[str, str]] = None,
+    ctx: Any = None,
 ) -> tuple[ReviewContext, ReviewResult]:
     """命令安全校验：委托审核引擎进行多模式审核。"""
     if not command.strip():
@@ -479,7 +499,7 @@ def _validate_command(
         raise RuntimeError("命令长度超过限制（最大10000字符）")
 
     _, environment_names, environment_digest = build_environment_plan(environment)
-    ctx = ReviewContext(
+    ctx_obj = ReviewContext(
         tool=tool,
         command=command,
         host=host,
@@ -487,10 +507,11 @@ def _validate_command(
         shell=shell,
         environment=environment_names,
         environment_digest=environment_digest,
+        mcp_ctx=ctx,
     )
-    result = _review_context(ctx)
+    result = _review_context(ctx_obj)
     _log.debug("command_validated", command=command[:500], mode=_review_engine.get_mode())
-    return ctx, result
+    return ctx_obj, result
 
 
 def _normalize_command(command: str, shell: Optional[str] = None) -> str:
@@ -730,6 +751,11 @@ def ssh_exec(
         ).to_dict()
     normalized_environment, _, _ = build_environment_plan(environment)
     try:
+        mcp_ctx = None
+        try:
+            mcp_ctx = mcp.get_context()
+        except Exception:
+            mcp_ctx = None
         plan_ctx, review_result = _validate_command(
             command,
             allow_dangerous=allow_dangerous,
@@ -737,6 +763,7 @@ def ssh_exec(
             tool="ssh_exec",
             shell=shell,
             environment=normalized_environment,
+            ctx=mcp_ctx,
         )
     except ReviewRejectedError as e:
         return make_rejected(
@@ -1130,6 +1157,7 @@ def ssh_upload(host: str, local_path: str, remote_path: str, timeout: int = 60, 
         local_path=str(local),
         remote_path=remote_path,
         overwrite=overwrite,
+        mcp_ctx=_get_mcp_ctx(),
     )
     try:
         review_result = _review_context(ctx)
@@ -1235,6 +1263,7 @@ def ssh_download(host: str, remote_path: str, local_path: str, timeout: int = 60
         allow_dangerous=allow_sensitive,
         local_path=str(local),
         remote_path=remote_path,
+        mcp_ctx=_get_mcp_ctx(),
     )
     try:
         review_result = _review_context(ctx)
@@ -1351,6 +1380,7 @@ def ssh_exec_batch(host: str, commands: list[str], timeout: int = 30, stop_on_er
             host=host,
             path=f"count={len(commands)}",
             allow_dangerous=False,
+            mcp_ctx=_get_mcp_ctx(),
         ))
     except ReviewRejectedError as e:
         return make_rejected(str(e), tool="ssh_exec_batch", host=host).to_dict()
@@ -1565,6 +1595,7 @@ def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 
             remote_path=remote_path,
             recursive=parents,
             allow_dangerous=True,
+            mcp_ctx=_get_mcp_ctx(),
         ))
     except ReviewRejectedError as e:
         return make_rejected(str(e), tool="ssh_mkdir", host=host).to_dict()
@@ -1596,6 +1627,7 @@ def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: in
         allow_dangerous=recursive,
         remote_path=remote_path,
         recursive=recursive,
+        mcp_ctx=_get_mcp_ctx(),
     )
     try:
         review_result = _review_context(ctx)
@@ -1671,6 +1703,7 @@ def ssh_upload_dir(host: str, local_dir: str, remote_dir: str, overwrite: bool =
         remote_path=remote_dir,
         recursive=True,
         overwrite=overwrite,
+        mcp_ctx=_get_mcp_ctx(),
     )
     try:
         review_result = _review_context(plan_ctx)
@@ -1815,6 +1848,7 @@ def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive
         local_path=str(local),
         remote_path=remote_dir,
         recursive=True,
+        mcp_ctx=_get_mcp_ctx(),
     )
     try:
         review_result = _review_context(plan_ctx)
@@ -1936,7 +1970,6 @@ def ssh_get_review_mode() -> dict:
         f"📋 白名单文件: {status['whitelist_file']}",
         f"   文件存在: {'是' if status['whitelist_exists'] else '否（使用内置默认规则）'}",
         f"⏱️  人工确认超时: {status['manual_timeout']}s",
-        f"🔑 运行时切换授权: {'是' if status['runtime_switch_enabled'] else '否'}",
         "",
         "可选模式:",
         "  off       - 关闭审核，所有操作直接放行（仅记日志）",
@@ -1946,6 +1979,7 @@ def ssh_get_review_mode() -> dict:
     ]
     env = make_success(
         tool="ssh_get_review_mode",
+        host="",
         data={"status": status},
         text="\n".join(lines),
     )
@@ -1954,18 +1988,18 @@ def ssh_get_review_mode() -> dict:
 
 @mcp.tool()
 @_tool_boundary("ssh_set_review_mode")
-def ssh_set_review_mode(mode: str) -> dict:
-    """动态切换审核模式。"""
+def ssh_set_review_mode(
+    mode: Literal["off", "whitelist", "manual", "smart"],
+) -> dict:
+    """动态切换审核模式。可选: off / whitelist / manual / smart。"""
     old_mode = _review_engine.get_mode()
-    success, message = _review_engine.set_mode(
-        mode,
-        authorized=_review_engine.config.allow_runtime_switch,
-    )
+    success, message = _review_engine.set_mode(mode)
     data = {"old_mode": old_mode, "new_mode": mode, "success": success}
     text = f"✅ {message}" if success else f"❌ {message}"
     if success:
         return make_success(
             tool="ssh_set_review_mode",
+            host="",
             data=data,
             text=text,
         ).to_dict()
@@ -1975,6 +2009,203 @@ def ssh_set_review_mode(mode: str) -> dict:
         data=data,
         text=text,
     ).to_dict()
+
+
+@mcp.tool()
+@_tool_boundary("ssh_get_audit_logs")
+def ssh_get_audit_logs(
+    limit: int = 50,
+    host: Optional[str] = None,
+    tool: Optional[str] = None,
+    since_minutes: int = 0,
+) -> dict:
+    """查询最近的行为日志（只读，供 AI 分析）。
+
+    读取 ~/.ssh/mcp-ssh.log（或 SSH_LOG_FILE），按事件聚合为统一行为视图，
+    返回每条含 timestamp/host/username/tool/args/status/duration_ms。
+    支持按 host / tool / since_minutes 过滤；输出受 limit 与大小上限约束。
+    """
+    limit = max(1, min(int(limit), 500))
+    since_minutes = max(0, int(since_minutes))
+    log_path = pathlib.Path(os.getenv("SSH_LOG_FILE", "")) if os.getenv("SSH_LOG_FILE") else None
+    if log_path is None:
+        log_path = _SSH_DIR / "mcp-ssh.log"
+
+    if not log_path.exists():
+        _log.error("ssh_log_query_failed", path=str(log_path), reason="file_missing")
+        return make_failure(
+            ERROR_LOCAL_IO_ERROR,
+            f"日志文件不存在: {log_path}",
+            tool="ssh_get_audit_logs",
+        ).to_dict()
+
+    username_map: dict[str, str] = {}
+    behavior: list[dict] = []
+    envelope_status: dict[tuple[str, str], str] = {}
+    skipped = 0
+
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        _log.error("ssh_log_query_failed", path=str(log_path), reason="read_failed", error=str(e))
+        return make_failure(
+            ERROR_LOCAL_IO_ERROR,
+            f"日志文件读取失败: {e}",
+            tool="ssh_get_audit_logs",
+        ).to_dict()
+
+    # 第一遍：建立 username 映射 + envelope status（按 tool+ts 关联）
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        event = entry.get("event", "")
+        if event == "ssh_connected" and entry.get("host"):
+            username_map[entry["host"]] = entry.get("username") or ""
+        elif event == "ssh_result_envelope" and entry.get("tool"):
+            envelope_status[(entry["tool"], entry.get("ts", ""))] = entry.get("status") or "unknown"
+
+    cutoff_ts = None
+    if since_minutes > 0:
+        cutoff_ts = time.time() - since_minutes * 60
+
+    # 第二遍：聚合行为视图
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        event = entry.get("event", "")
+        ts_raw = entry.get("ts", "")
+        try:
+            ts_str = ts_raw.replace("Z", "+00:00")
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            ts_epoch = ts.timestamp()
+        except (ValueError, TypeError, OSError):
+            ts_epoch = None
+        if cutoff_ts is not None and (ts_epoch is None or ts_epoch < cutoff_ts):
+            continue
+
+        record: dict | None = None
+        if event in ("ssh_exec_done", "ssh_exec_batch_done", "sftp_atomic_write_ok",
+                     "sftp_atomic_write_failed", "sftp_bounded_walk_limit"):
+            tool_name = "ssh_exec" if event == "ssh_exec_done" else (
+                "ssh_exec_batch" if event == "ssh_exec_batch_done" else event
+            )
+            args: dict = {}
+            if "command" in entry:
+                args["command"] = entry["command"]
+            if "remote" in entry:
+                args["remote_path"] = entry["remote"]
+            if "commands_count" in entry:
+                args["commands_count"] = entry["commands_count"]
+            record = {
+                "timestamp": ts_raw,
+                "host": entry.get("host") or "",
+                "username": username_map.get(entry.get("host") or "", None),
+                "tool": tool_name,
+                "args": args,
+                "status": envelope_status.get((tool_name, ts_raw), "unknown"),
+                "duration_ms": round((entry.get("elapsed") or 0) * 1000),
+            }
+        elif event == "review_mode_changed":
+            record = {
+                "timestamp": ts_raw,
+                "host": "",
+                "username": None,
+                "tool": "ssh_set_review_mode",
+                "args": {"old": entry.get("old"), "new": entry.get("new")},
+                "status": "succeeded",
+                "duration_ms": 0,
+            }
+        if record is None:
+            continue
+        if host and record["host"] != host:
+            continue
+        if tool and record["tool"] != tool:
+            continue
+        behavior.append(record)
+
+    # 时间倒序（最新在前）
+    behavior.sort(key=lambda r: r["timestamp"], reverse=True)
+    # 单条 args 脱敏 + 截断
+    for record in behavior:
+        record["args"] = _redact_log_args(record["args"])
+        record["args"] = _truncate_log_args(record["args"])
+    # limit 截断 + 总输出控制
+    total = len(behavior)
+    truncated = total > limit
+    behavior = behavior[:limit]
+    output_bytes = sum(
+        len(json.dumps(r, ensure_ascii=False, default=str)) for r in behavior
+    )
+    max_output = 200 * 1024
+    while behavior and output_bytes > max_output and len(behavior) > 1:
+        behavior = behavior[:-1]
+        output_bytes = sum(
+            len(json.dumps(r, ensure_ascii=False, default=str)) for r in behavior
+        )
+
+    _log.info("ssh_get_audit_logs_done", count=len(behavior), total=total,
+              filtered_host=host, filtered_tool=tool, skipped=skipped)
+    return make_success(
+        tool="ssh_get_audit_logs",
+        host="",
+        data={
+            "logs": behavior,
+            "total": total,
+            "returned": len(behavior),
+            "skipped": skipped,
+            "truncated": truncated,
+        },
+        text=_render_log_query_text(behavior, total),
+    ).to_dict()
+
+
+def _redact_log_args(args: dict) -> dict:
+    """脱敏 args 中 export K=V 的值，避免凭据泄露。"""
+    redacted: dict = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            redacted[key] = re.sub(
+                r"(export\s+[A-Za-z_][A-Za-z0-9_]*=)[^;]+", r"\1***", value
+            )
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _truncate_log_args(args: dict) -> dict:
+    """单条 args 序列化超过 500 字符时截断并标记 truncated。"""
+    text = json.dumps(args, ensure_ascii=False, default=str)
+    if len(text) <= 500:
+        return args
+    return {"_truncated": True, "summary": text[:500]}
+
+
+def _render_log_query_text(records: list[dict], total: int) -> str:
+    """渲染人类可读的日志查询结果文本。"""
+    if not records:
+        return f"未找到匹配日志（总数 {total} 条）。"
+    lines = [f"最近 {len(records)} 条行为日志（共 {total} 条）:"]
+    for r in records:
+        host = r.get("host") or "-"
+        user = r.get("username") or "-"
+        ts = r.get("timestamp") or "-"
+        tool = r.get("tool") or "-"
+        status = r.get("status") or "unknown"
+        args = json.dumps(r.get("args") or {}, ensure_ascii=False)[:120]
+        lines.append(f"[{ts}] {user}@{host} {tool} → {status} args={args}")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    mcp.run()
 
 
 def main() -> None:
