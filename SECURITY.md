@@ -4,8 +4,8 @@
 
 | Version | Security status |
 | --- | --- |
-| `1.0.0` (current release) | Actively supported |
-| `main` (unreleased) | Best-effort fixes during development |
+| `1.0.0-main` (current release) | Actively supported |
+| `` (unreleased) | Best-effort fixes during development |
 | `0.x` (including the historical `Ver.1.0.0` demo tag) | Not supported as a production release |
 
 The historical Git tag `Ver.1.0.0` (and `Ver.0.0.1`) points to the same demo commit and is **not** the 1.0.0 release. The official 1.0.0 release is tracked by `pyproject.toml` version `1.0.0` and the artifacts in `docs/release-evidence-1.0.0.md`.
