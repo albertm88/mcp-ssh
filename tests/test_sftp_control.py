@@ -1,7 +1,7 @@
-"""Fake-SFTP tests for atomic upload/download, bounded recursion and cleanup.
+﻿"""Fake-SFTP tests for atomic upload/download, bounded recursion and cleanup.
 
 These tests exercise `server._sftp_put_atomic`, `_sftp_get_atomic` and
-`_sftp_bounded_walk` against an in-memory fake, so they run offline and are
+`_bounded_walk` against an in-memory fake, so they run offline and are
 deterministic.
 """
 from __future__ import annotations
@@ -13,8 +13,7 @@ import pytest
 from server import (
     ChecksumMismatchError,
     ResourceLimitError,
-    _local_bounded_walk,
-    _sftp_bounded_walk,
+    _bounded_walk,
     _sftp_get_atomic,
     _sftp_put_atomic,
 )
@@ -141,7 +140,7 @@ class TestAtomicPut:
         assert info["bytes"] == local_file.stat().st_size
         assert info["atomic"] is True
         assert fake_sftp.files["/dst/file.txt"][1] == local_file.stat().st_size
-        # 临时文件已替换为目标，无残留
+        # 涓存椂鏂囦欢宸叉浛鎹负鐩爣锛屾棤娈嬬暀
         assert any(name.startswith(".file.txt.") for name in fake_sftp.files) is False
         assert fake_sftp.renames
 
@@ -181,7 +180,7 @@ class TestAtomicPut:
 
         with pytest.raises(ChecksumMismatchError):
             _sftp_put_atomic(fake_sftp, local_file, "/dst/file.txt", overwrite=False)
-        # 目标未被覆盖，临时文件已清理
+        # 鐩爣鏈瑕嗙洊锛屼复鏃舵枃浠跺凡娓呯悊
         assert "/dst/file.txt" not in fake_sftp.files
         assert any(name.startswith(".file.txt.") for name in fake_sftp.files) is False
 
@@ -209,7 +208,7 @@ class TestAtomicGet:
         with pytest.raises(ChecksumMismatchError):
             _sftp_get_atomic(fake_sftp, "/src/data.bin", target)
 
-        # 失败不覆盖已有文件，且临时文件被清理
+        # 澶辫触涓嶈鐩栧凡鏈夋枃浠讹紝涓斾复鏃舵枃浠惰娓呯悊
         assert target.read_bytes() == b"precious"
         assert list(tmp_path.iterdir()) == [target]
 
@@ -221,7 +220,7 @@ class TestBoundedWalk:
             fake_sftp.files[f"/root/f{i}.txt"] = (False, 10, b"a" * 10)
 
         with pytest.raises(ResourceLimitError):
-            _sftp_bounded_walk(fake_sftp, "/root", max_files=3)
+            _bounded_walk("/root", sftp=fake_sftp, max_files=3)
 
     def test_recursion_limits_total_bytes(self, fake_sftp: FakeSFTP) -> None:
         fake_sftp.files["/root"] = (True, 0, b"")
@@ -229,7 +228,7 @@ class TestBoundedWalk:
         fake_sftp.files["/root/b.txt"] = (False, 200, b"b" * 200)
 
         with pytest.raises(ResourceLimitError):
-            _sftp_bounded_walk(fake_sftp, "/root", max_files=10, max_bytes=250)
+            _bounded_walk("/root", sftp=fake_sftp, max_files=10, max_bytes=250)
 
     def test_recursion_limits_depth(self, fake_sftp: FakeSFTP) -> None:
         fake_sftp.files["/root"] = (True, 0, b"")
@@ -238,7 +237,7 @@ class TestBoundedWalk:
         fake_sftp.files["/root/d1/d2/file.txt"] = (False, 10, b"a" * 10)
 
         with pytest.raises(ResourceLimitError):
-            _sftp_bounded_walk(fake_sftp, "/root", max_depth=1)
+            _bounded_walk("/root", sftp=fake_sftp, max_depth=1)
 
     def test_returns_flat_entries(self, fake_sftp: FakeSFTP) -> None:
         fake_sftp.files["/root"] = (True, 0, b"")
@@ -246,10 +245,43 @@ class TestBoundedWalk:
         fake_sftp.files["/root/sub"] = (True, 0, b"")
         fake_sftp.files["/root/sub/b.txt"] = (False, 20, b"b" * 20)
 
-        entries = _sftp_bounded_walk(fake_sftp, "/root", max_files=100, max_bytes=100000, max_depth=10)
+        entries = _bounded_walk("/root", sftp=fake_sftp, max_files=100, max_bytes=100000, max_depth=10)
 
         paths = {e["path"] for e in entries}
         assert paths == {"/root/a.txt", "/root/sub", "/root/sub/b.txt"}
+
+    def test_sftp_walk_rejects_symlink_escape(
+        self, fake_sftp: FakeSFTP, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        fake_sftp.files["/root"] = (True, 0, b"")
+        fake_sftp.files["/root/real.txt"] = (False, 10, b"a" * 10)
+
+        def listdir_with_symlink(name: str) -> list[object]:
+            if name == "/root":
+                return [
+                    SimpleNamespace(filename="real.txt", st_mode=0o100644, st_size=10),
+                    SimpleNamespace(filename="escape", st_mode=0o120777, st_size=20),
+                ]
+            return fake_sftp.listdir_attr(name)
+
+        monkeypatch.setattr(fake_sftp, "listdir_attr", listdir_with_symlink)
+
+        with pytest.raises(ResourceLimitError):
+            _bounded_walk("/root", sftp=fake_sftp)
+
+    def test_sftp_walk_limits_file_count_for_dirs(
+        self, fake_sftp: FakeSFTP
+    ) -> None:
+        fake_sftp.files["/root"] = (True, 0, b"")
+        fake_sftp.files["/root/a"] = (True, 0, b"")
+        fake_sftp.files["/root/b"] = (True, 0, b"")
+        fake_sftp.files["/root/a/f1"] = (False, 1, b"x")
+        fake_sftp.files["/root/b/f2"] = (False, 1, b"y")
+
+        with pytest.raises(ResourceLimitError):
+            _bounded_walk("/root", sftp=fake_sftp, max_files=3)
 
 
 class TestLocalBoundedWalk:
@@ -258,11 +290,37 @@ class TestLocalBoundedWalk:
         (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
 
         with pytest.raises(ResourceLimitError):
-            _local_bounded_walk(tmp_path)
+            _bounded_walk(tmp_path)
 
     def test_local_walk_limits_bytes(self, tmp_path: pathlib.Path) -> None:
         (tmp_path / "a.txt").write_bytes(b"a" * 100)
         (tmp_path / "b.txt").write_bytes(b"b" * 200)
 
         with pytest.raises(ResourceLimitError):
-            _local_bounded_walk(tmp_path, max_files=10, max_bytes=250)
+            _bounded_walk(tmp_path, max_files=10, max_bytes=250)
+
+    def test_local_walk_limits_file_count(self, tmp_path: pathlib.Path) -> None:
+        for i in range(5):
+            (tmp_path / f"f{i}.txt").write_bytes(b"x")
+
+        with pytest.raises(ResourceLimitError):
+            _bounded_walk(tmp_path, max_files=3)
+
+    def test_local_walk_limits_depth(self, tmp_path: pathlib.Path) -> None:
+        d = tmp_path / "d1" / "d2"
+        d.mkdir(parents=True)
+        (d / "file.txt").write_bytes(b"x")
+
+        with pytest.raises(ResourceLimitError):
+            _bounded_walk(tmp_path, max_depth=1)
+
+    def test_local_walk_returns_flat_entries(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "a.txt").write_bytes(b"a" * 10)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_bytes(b"b" * 20)
+
+        entries = _bounded_walk(tmp_path, max_files=100, max_bytes=100000, max_depth=10)
+
+        paths = {e["path"].relative_to(tmp_path).as_posix() for e in entries}
+        assert paths == {"a.txt", "sub", "sub/b.txt"}

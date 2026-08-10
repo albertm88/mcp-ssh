@@ -93,7 +93,6 @@ _MAX_SINGLE_FILE_BYTES = 100 * 1024 * 1024  # 100 MiB
 _MAX_DIR_FILES = 2000
 _MAX_DIR_BYTES = 1024 * 1024 * 1024  # 1 GiB
 _MAX_RECURSE_DEPTH = 32
-_MAX_SCAN_ADDRESSES = 4096
 _MAX_OUTPUT_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -637,98 +636,83 @@ def _sftp_get_atomic(
         raise
 
 
-def _sftp_bounded_walk(
-    sftp: paramiko.SFTPClient,
-    root: str,
+def _bounded_walk(
+    root,
+    *,
+    sftp=None,
     max_files: int = _MAX_DIR_FILES,
     max_bytes: int = _MAX_DIR_BYTES,
     max_depth: int = _MAX_RECURSE_DEPTH,
 ) -> list[dict]:
-    """有界递归遍历：拒绝软链接逃逸、超过文件数/总字节/深度。"""
+    """有界递归遍历：拒绝软链接逃逸、超过文件数/总字节/深度。
+
+    传入 `sftp`（paramiko.SFTPClient）时走 SFTP `listdir_attr`；
+    否则 `root` 视为本地 pathlib.Path，走 `iterdir`。
+
+    返回条目统一为 `{"path", "size", "is_dir"}` 字典。
+    """
     entries: list[dict] = []
     total_files = 0
     total_bytes = 0
+    is_sftp = sftp is not None
 
-    def _walk(path: str, depth: int) -> None:
+    def _walk(path, depth: int) -> None:
         nonlocal total_files, total_bytes
         if depth > max_depth:
             raise ResourceLimitError(f"递归深度超过限制 {max_depth}")
         try:
-            attrs = sftp.listdir_attr(path)
-        except FileNotFoundError:
+            if is_sftp:
+                attrs = sftp.listdir_attr(path)
+                files = [attr.filename for attr in attrs]
+            else:
+                files = sorted(path.iterdir(), key=lambda p: p.name)
+        except (FileNotFoundError, OSError):
             return
-        if total_files + len(attrs) > max_files:
+        if not is_sftp and total_files + len(files) > max_files:
             raise ResourceLimitError(
                 f"目录 {path} 条目数超过剩余配额（{max_files - total_files}）"
             )
-        for attr in attrs:
-            mode = attr.st_mode
-            if mode & 0o170000 == 0o120000:
-                raise ResourceLimitError(f"拒绝软链接逃逸：{path}/{attr.filename}")
-            child = f"{path}/{attr.filename}" if str(path) not in ("", "/") else f"{path}{attr.filename}"
-            if mode & 0o40000:
+        for idx, child in enumerate(files):
+            if is_sftp:
+                attr = attrs[idx]
+                mode = attr.st_mode
+                if mode & 0o170000 == 0o120000:
+                    raise ResourceLimitError(f"拒绝软链接逃逸：{path}/{attr.filename}")
+                child_path = (
+                    f"{path}/{attr.filename}"
+                    if str(path) not in ("", "/")
+                    else f"{path}{attr.filename}"
+                )
+                is_dir = bool(mode & 0o40000)
+                is_file = bool(mode & 0o100000)
+                size = attr.st_size
+            else:
+                if child.is_symlink():
+                    raise ResourceLimitError(f"拒绝软链接逃逸：{child}")
+                is_dir = child.is_dir()
+                is_file = child.is_file()
+                child_path = child
+                size = child.stat().st_size if is_file else 0
+            if is_dir:
                 total_files += 1
                 if total_files > max_files:
                     raise ResourceLimitError(f"文件数超过限制 {max_files}")
-                entries.append({"path": child, "size": 0, "is_dir": True})
-                _walk(child, depth + 1)
-            elif mode & 0o100000:
+                entries.append({"path": child_path, "size": 0, "is_dir": True})
+                _walk(child_path, depth + 1)
+            elif is_file:
                 total_files += 1
-                total_bytes += attr.st_size
-                if total_files > max_files:
-                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
-                if total_bytes > max_bytes:
-                    raise ResourceLimitError(f"总字节超过限制 {max_bytes}")
-                entries.append({"path": child, "size": attr.st_size, "is_dir": False})
-
-    _walk(root, 0)
-    return entries
-
-
-def _local_bounded_walk(
-    root: pathlib.Path,
-    max_files: int = _MAX_DIR_FILES,
-    max_bytes: int = _MAX_DIR_BYTES,
-    max_depth: int = _MAX_RECURSE_DEPTH,
-) -> list[dict]:
-    """本地有界递归：拒绝软链接逃逸、超过文件数/总字节/深度。"""
-    entries: list[dict] = []
-    total_files = 0
-    total_bytes = 0
-
-    def _walk(path: pathlib.Path, depth: int) -> None:
-        nonlocal total_files, total_bytes
-        if depth > max_depth:
-            raise ResourceLimitError(f"递归深度超过限制 {max_depth}")
-        try:
-            children = sorted(path.iterdir(), key=lambda p: p.name)
-        except OSError:
-            return
-        for child in children:
-            if child.is_symlink():
-                raise ResourceLimitError(f"拒绝软链接逃逸：{child}")
-            if child.is_dir():
-                total_files += 1
-                if total_files > max_files:
-                    raise ResourceLimitError(f"文件数超过限制 {max_files}")
-                entries.append({"path": child, "size": 0, "is_dir": True})
-                _walk(child, depth + 1)
-            elif child.is_file():
-                total_files += 1
-                size = child.stat().st_size
                 total_bytes += size
                 if total_files > max_files:
                     raise ResourceLimitError(f"文件数超过限制 {max_files}")
                 if total_bytes > max_bytes:
                     raise ResourceLimitError(f"总字节超过限制 {max_bytes}")
-                entries.append({"path": child, "size": size, "is_dir": False})
+                entries.append({"path": child_path, "size": size, "is_dir": False})
 
     _walk(root, 0)
     return entries
 
 
-# ---------------------------------------------------------------------------
-# 14 个 MCP 工具（全部经 _tool_boundary 钩子统一错误边界）
+# 11 个 MCP 工具（全部经 _tool_boundary 钩子统一错误边界）
 # ---------------------------------------------------------------------------
 
 
@@ -979,7 +963,7 @@ def ssh_list_hosts() -> dict:
     _log.info("ssh_list_hosts_done", count=len(hosts))
     if not hosts:
         return make_success(
-            tool="ssh_list_hosts",
+            tool="ssh_list_hosts", host="",
             data={"hosts": []},
             text="~/.ssh/config 中没有配置 Host 别名。",
         ).to_dict()
@@ -997,135 +981,9 @@ def ssh_list_hosts() -> dict:
         output.append("  " + " ".join(info))
         entries.append(entry)
     env = make_success(
-        tool="ssh_list_hosts",
+        tool="ssh_list_hosts", host="",
         data={"hosts": entries},
         text="\n".join(output),
-    )
-    return env.to_dict()
-
-
-def _scan_subnet(cidr: str, port: int, per_host_timeout: float, max_workers: int) -> list[dict]:
-    """扫描 CIDR 网段指定端口，返回在线主机列表（含 IP、端口、SSH banner）。"""
-    import ipaddress
-    import concurrent.futures
-
-    network = ipaddress.ip_network(cidr, strict=False)
-    hosts = [str(ip) for ip in network.hosts()]
-    results: list[dict] = []
-
-    def probe(ip: str) -> dict | None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(per_host_timeout)
-        try:
-            s.connect((ip, port))
-            banner = ""
-            if port == 22:
-                try:
-                    s.settimeout(per_host_timeout)
-                    data = s.recv(256)
-                    if data:
-                        banner = data.decode("utf-8", errors="replace").strip()
-                except (socket.timeout, OSError):
-                    pass
-            return {"ip": ip, "port": port, "banner": banner}
-        except (socket.timeout, OSError):
-            return None
-        finally:
-            s.close()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for r in ex.map(probe, hosts):
-            if r:
-                results.append(r)
-    return results
-
-
-@mcp.tool()
-@_tool_boundary("ssh_scan")
-def ssh_scan(
-    network: str = "192.168.1.0/24",
-    port: int = 22,
-    timeout: float = 3.0,
-    max_workers: int = 100,
-    detail: bool = True,
-) -> dict:
-    """扫描局域网网段，发现开放指定端口（默认 SSH 22）的在线主机。"""
-    try:
-        review_result = _review_context(ReviewContext(
-            tool="ssh_scan",
-            command=(
-                f"scan network={network} port={port} timeout={timeout} "
-                f"max_workers={max_workers} detail={detail}"
-            ),
-            path=network,
-        ))
-    except ReviewRejectedError as e:
-        return make_rejected(str(e), tool="ssh_scan").to_dict()
-    t0 = time.monotonic()
-    _log.info("ssh_scan_start", network=network, port=port, timeout=timeout)
-
-    import ipaddress as _ipaddress
-
-    try:
-        net = _ipaddress.ip_network(network, strict=False)
-        address_count = net.num_addresses
-    except ValueError as e:
-        _log.warning("ssh_scan_bad_cidr", network=network, error=str(e))
-        return make_failure(
-            ERROR_INVALID_ARGUMENT, f"无效的网段格式：{network}（{e}）",
-            tool="ssh_scan", review=_review_summary(review_result),
-        ).to_dict()
-    if address_count > _MAX_SCAN_ADDRESSES:
-        _log.warning("ssh_scan_limit", network=network, addresses=address_count)
-        return make_failure(
-            ERROR_RESOURCE_LIMIT,
-            f"扫描地址数超过限制（最大{_MAX_SCAN_ADDRESSES}，当前{address_count}）",
-            tool="ssh_scan", review=_review_summary(review_result),
-        ).to_dict()
-
-    try:
-        results = _scan_subnet(network, port, timeout, max_workers)
-    except ValueError as e:
-        _log.warning("ssh_scan_bad_cidr", network=network, error=str(e))
-        return make_failure(
-            ERROR_INVALID_ARGUMENT, f"无效的网段格式：{network}（{e}）",
-            tool="ssh_scan", review=_review_summary(review_result),
-        ).to_dict()
-
-    elapsed = time.monotonic() - t0
-    _log.info("ssh_scan_done", network=network, port=port,
-              found=len(results), elapsed=round(elapsed, 3))
-
-    if not results:
-        text = f"网段 {network} 中未发现开放端口 {port} 的主机（耗时 {round(elapsed, 1)}s）。"
-        return make_success(
-            tool="ssh_scan",
-            data={"network": network, "port": port, "found": 0, "hosts": []},
-            text=text,
-            review=_review_summary(review_result),
-            duration_ms=int(elapsed * 1000),
-        ).to_dict()
-
-    output = [f"🔍 扫描 {network} 端口 {port}，发现 {len(results)} 台在线主机（耗时 {round(elapsed, 1)}s）："]
-    output.append("-" * 70)
-    output.append(f"{'序号':<4} {'IP 地址':<18} {'端口':<6} {'SSH Banner / 设备信息'}")
-    output.append("-" * 70)
-    for i, host in enumerate(sorted(results, key=lambda x: tuple(int(p) for p in x["ip"].split("."))), 1):
-        banner = host.get("banner", "") if detail else ""
-        output.append(f"{i:<4} {host['ip']:<18} {host['port']:<6} {banner}")
-    output.append("-" * 70)
-    output.append(f"💡 可使用 ssh_exec 在这些主机上执行命令（如 ssh_exec('user@IP', 'hostname')）")
-    env = make_success(
-        tool="ssh_scan",
-        data={
-            "network": network,
-            "port": port,
-            "found": len(results),
-            "hosts": results if detail else [{"ip": h["ip"], "port": h["port"]} for h in results],
-        },
-        text="\n".join(output),
-        review=_review_summary(review_result),
-        duration_ms=int(elapsed * 1000),
     )
     return env.to_dict()
 
@@ -1465,21 +1323,20 @@ def ssh_exec_batch(host: str, commands: list[str], timeout: int = 30, stop_on_er
     return env.to_dict()
 
 
-@mcp.tool()
-@_tool_boundary("ssh_list_dir")
-def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, timeout: int = 10) -> dict:
+def _fs_list(host: str, remote_path: str, show_hidden: bool, timeout: int) -> dict:
     """列出远程主机指定目录下的文件和子目录。"""
     if not show_hidden and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("list_sensitive_dir", path=remote_path)
         return make_failure(
             ERROR_INVALID_ARGUMENT, f"禁止列出敏感目录：{remote_path}",
-            tool="ssh_list_dir", host=host,
+            tool="ssh_filesystem", host=host, data={"action": "list"},
         ).to_dict()
     try:
         _reject_remote_traversal(remote_path)
     except ValueError as e:
         return make_failure(
-            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_list_dir", host=host,
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_filesystem", host=host,
+            data={"action": "list"},
         ).to_dict()
 
     ls_cmd = f"ls -la --time-style=long-iso {shlex.quote(remote_path)}"
@@ -1492,7 +1349,7 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
         return make_failure(
             err.get("code", ERROR_REMOTE_EXIT_NONZERO),
             err.get("message", f"列出目录失败：{remote_path}"),
-            tool="ssh_list_dir", host=host,
+            tool="ssh_filesystem", host=host, data={"action": "list"},
         ).to_dict()
     out = result.get("data", {}).get("stdout", "")
 
@@ -1504,6 +1361,7 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
     entries: list[dict] = []
 
     for line in lines:
+        line = line.rstrip("\r\n")
         if not line.strip():
             continue
         parts = line.split(maxsplit=6)
@@ -1511,8 +1369,10 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
             continue
         perm = parts[0]
         size = parts[4]
-        mtime = f"{parts[5]} {parts[6].split()[0]}"
-        name = parts[6] if len(parts) > 6 else ""
+        tail = parts[6] if len(parts) > 6 else ""
+        tail_parts = tail.split(maxsplit=1)
+        mtime = f"{parts[5]} {tail_parts[0]}" if tail_parts else parts[5]
+        name = tail_parts[1] if len(tail_parts) > 1 else ""
         if name in (".", ".."):
             continue
         if not show_hidden and name.startswith("."):
@@ -1540,16 +1400,14 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
         })
 
     env = make_success(
-        tool="ssh_list_dir", host=host,
-        data={"path": remote_path, "entries": entries},
+        tool="ssh_filesystem", host=host,
+        data={"action": "list", "path": remote_path, "entries": entries},
         text="\n".join(output),
     )
     return env.to_dict()
 
 
-@mcp.tool()
-@_tool_boundary("ssh_stat_file")
-def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> dict:
+def _fs_stat(host: str, remote_path: str, timeout: int) -> dict:
     """获取远程文件或目录的详细信息。"""
     result = ssh_exec(host, f"stat {shlex.quote(remote_path)}", timeout=timeout)
     if result.get("status") != STATUS_SUCCEEDED:
@@ -1557,38 +1415,37 @@ def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> dict:
         return make_failure(
             err.get("code", ERROR_REMOTE_EXIT_NONZERO),
             err.get("message", f"stat 失败：{remote_path}"),
-            tool="ssh_stat_file", host=host,
+            tool="ssh_filesystem", host=host, data={"action": "stat"},
         ).to_dict()
     out = result.get("data", {}).get("stdout", "")
     env = make_success(
-        tool="ssh_stat_file", host=host,
-        data={"path": remote_path, "stat": out},
+        tool="ssh_filesystem", host=host,
+        data={"action": "stat", "path": remote_path, "stat": out},
         text=f"📄 {remote_path}\n{out}",
     )
     return env.to_dict()
 
 
-@mcp.tool()
-@_tool_boundary("ssh_mkdir")
-def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 10) -> dict:
+def _fs_mkdir(host: str, remote_path: str, parents: bool, timeout: int) -> dict:
     """在远程主机创建目录。"""
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("mkdir_sensitive_path", path=remote_path)
         return make_failure(
             ERROR_INVALID_ARGUMENT, f"禁止在敏感路径创建目录：{remote_path}",
-            tool="ssh_mkdir", host=host,
+            tool="ssh_filesystem", host=host, data={"action": "mkdir"},
         ).to_dict()
     try:
         _reject_remote_traversal(remote_path)
     except ValueError as e:
         return make_failure(
-            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_mkdir", host=host,
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_filesystem", host=host,
+            data={"action": "mkdir"},
         ).to_dict()
 
     cmd = f"mkdir {'-p' if parents else ''} {shlex.quote(remote_path)}"
     try:
         review_result = _review_context(ReviewContext(
-            tool="ssh_mkdir",
+            tool="ssh_filesystem",
             command=cmd,
             host=host,
             path=remote_path,
@@ -1598,12 +1455,12 @@ def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 
             mcp_ctx=_get_mcp_ctx(),
         ))
     except ReviewRejectedError as e:
-        return make_rejected(str(e), tool="ssh_mkdir", host=host).to_dict()
+        return make_rejected(str(e), tool="ssh_filesystem", host=host).to_dict()
     result = ssh_exec(host, cmd, timeout=timeout, allow_dangerous=True)
     if result.get("status") == STATUS_SUCCEEDED:
         return make_success(
-            tool="ssh_mkdir", host=host,
-            data={"path": remote_path, "parents": parents},
+            tool="ssh_filesystem", host=host,
+            data={"action": "mkdir", "path": remote_path, "parents": parents},
             text=f"✅ 目录创建成功：{remote_path}",
             review=_review_summary(review_result),
         ).to_dict()
@@ -1611,16 +1468,15 @@ def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 
     return make_failure(
         err.get("code", ERROR_REMOTE_EXIT_NONZERO),
         err.get("message", f"目录创建失败：{remote_path}"),
-        tool="ssh_mkdir", host=host, review=_review_summary(review_result),
+        tool="ssh_filesystem", host=host, review=_review_summary(review_result),
+        data={"action": "mkdir"},
     ).to_dict()
 
 
-@mcp.tool()
-@_tool_boundary("ssh_remove")
-def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: int = 30) -> dict:
+def _fs_remove(host: str, remote_path: str, recursive: bool, timeout: int) -> dict:
     """删除远程主机上的文件或目录。"""
     ctx = ReviewContext(
-        tool="ssh_remove",
+        tool="ssh_filesystem",
         command=f"remove {remote_path} (recursive={recursive})",
         host=host,
         path=remote_path,
@@ -1632,20 +1488,21 @@ def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: in
     try:
         review_result = _review_context(ctx)
     except ReviewRejectedError as e:
-        return make_rejected(str(e), tool="ssh_remove", host=host).to_dict()
+        return make_rejected(str(e), tool="ssh_filesystem", host=host).to_dict()
 
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("remove_sensitive_path", path=remote_path)
         return make_failure(
             ERROR_INVALID_ARGUMENT, f"禁止删除敏感路径：{remote_path}",
-            tool="ssh_remove", host=host, review=_review_summary(review_result),
+            tool="ssh_filesystem", host=host, review=_review_summary(review_result),
+            data={"action": "remove"},
         ).to_dict()
     try:
         _reject_remote_traversal(remote_path)
     except ValueError as e:
         return make_failure(
-            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_remove", host=host,
-            review=_review_summary(review_result),
+            ERROR_INVALID_ARGUMENT, str(e), tool="ssh_filesystem", host=host,
+            review=_review_summary(review_result), data={"action": "remove"},
         ).to_dict()
 
     if not recursive:
@@ -1656,8 +1513,8 @@ def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: in
     result = ssh_exec(host, cmd, timeout=timeout, allow_dangerous=True)
     if result.get("status") == STATUS_SUCCEEDED:
         return make_success(
-            tool="ssh_remove", host=host,
-            data={"path": remote_path, "recursive": recursive},
+            tool="ssh_filesystem", host=host,
+            data={"action": "remove", "path": remote_path, "recursive": recursive},
             text=f"✅ 删除成功：{remote_path}",
             review=_review_summary(review_result),
         ).to_dict()
@@ -1665,7 +1522,46 @@ def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: in
     return make_failure(
         err.get("code", ERROR_REMOTE_EXIT_NONZERO),
         err.get("message", f"删除失败：{remote_path}"),
-        tool="ssh_remove", host=host, review=_review_summary(review_result),
+        tool="ssh_filesystem", host=host, review=_review_summary(review_result),
+        data={"action": "remove"},
+    ).to_dict()
+
+
+@mcp.tool()
+@_tool_boundary("ssh_filesystem")
+def ssh_filesystem(
+    host: str,
+    action: Literal["list", "stat", "mkdir", "remove"],
+    remote_path: str,
+    parents: bool = True,
+    recursive: bool = False,
+    show_hidden: bool = False,
+    timeout: int = 10,
+) -> dict:
+    """远程文件系统操作：list（列出目录）/ stat（状态）/ mkdir（创建目录）/ remove（删除）。
+
+    `action` 决定操作类型：
+    - `list`：列出 `remote_path` 下的文件和子目录（`show_hidden` 控制是否显示隐藏文件）
+    - `stat`：获取 `remote_path` 的详细信息
+    - `mkdir`：创建目录（`parents=True` 时 `mkdir -p`）
+    - `remove`：删除文件或目录（`recursive=True` 时递归删除）
+    """
+    if not remote_path.strip():
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "remote_path 不能为空",
+            tool="ssh_filesystem", host=host,
+        ).to_dict()
+    if action == "list":
+        return _fs_list(host, remote_path, show_hidden, timeout)
+    if action == "stat":
+        return _fs_stat(host, remote_path, timeout)
+    if action == "mkdir":
+        return _fs_mkdir(host, remote_path, parents, timeout)
+    if action == "remove":
+        return _fs_remove(host, remote_path, recursive, timeout)
+    return make_failure(
+        ERROR_INVALID_ARGUMENT, f"不支持的 action：{action}",
+        tool="ssh_filesystem", host=host,
     ).to_dict()
 
 
@@ -1711,7 +1607,7 @@ def ssh_upload_dir(host: str, local_dir: str, remote_dir: str, overwrite: bool =
         return make_rejected(str(e), tool="ssh_upload_dir", host=host).to_dict()
 
     try:
-        local_entries = _local_bounded_walk(local)
+        local_entries = _bounded_walk(local)
     except ResourceLimitError as e:
         return make_failure(
             ERROR_RESOURCE_LIMIT, str(e), tool="ssh_upload_dir", host=host,
@@ -1867,7 +1763,7 @@ def ssh_download_dir(host: str, remote_dir: str, local_dir: str, allow_sensitive
         client = _connect(host, timeout=timeout)
         sftp = client.open_sftp()
         try:
-            remote_entries = _sftp_bounded_walk(sftp, remote_dir)
+            remote_entries = _bounded_walk(remote_dir, sftp=sftp)
         except ResourceLimitError as e:
             sftp.close()
             _log.error("sftp_bounded_walk_limit", host=host, remote=remote_dir, error=str(e))
@@ -2202,10 +2098,6 @@ def _render_log_query_text(records: list[dict], total: int) -> str:
         args = json.dumps(r.get("args") or {}, ensure_ascii=False)[:120]
         lines.append(f"[{ts}] {user}@{host} {tool} → {status} args={args}")
     return "\n".join(lines)
-
-
-def main() -> None:
-    mcp.run()
 
 
 def main() -> None:

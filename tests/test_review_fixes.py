@@ -191,7 +191,7 @@ class TestBatchEnvelope:
 class TestMkdirReviewBinding:
     def test_mkdir_embeds_review_binding(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _off_mode(monkeypatch)
-        res = server.ssh_mkdir("h", "/tmp/review-test-dir")
+        res = server.ssh_filesystem("h", action="mkdir", remote_path="/tmp/review-test-dir")
         assert res["review"].get("plan_id") == "fake-plan-id"
 
 

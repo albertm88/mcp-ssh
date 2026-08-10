@@ -18,13 +18,13 @@
 | 类别 | 1.0.0 必须提供的工具 |
 |---|---|
 | 命令 | `ssh_exec`、`ssh_exec_batch` |
-| 主机 | `ssh_list_hosts`、`ssh_scan` |
+| 主机 | `ssh_list_hosts` |
 | 文件 | `ssh_upload`、`ssh_download`、`ssh_upload_dir`、`ssh_download_dir` |
-| 远端文件系统 | `ssh_list_dir`、`ssh_stat_file`、`ssh_mkdir`、`ssh_remove` |
+| 远端文件系统 | `ssh_filesystem`（action：`list`/`stat`/`mkdir`/`remove`） |
 | 审核 | `ssh_get_review_mode`、`ssh_set_review_mode` |
 | 日志查询 | `ssh_get_audit_logs` |
 
-验收：MCP `tools/list` 精确包含以上 14 个工具 + `ssh_get_audit_logs`；旧参数调用均能通过 schema 校验。
+验收：MCP `tools/list` 精确包含以上 11 个工具；旧参数调用均能通过 schema 校验。
 
 ### FR-LOG 行为日志查询
 
@@ -40,7 +40,7 @@
 - [x] 远端端：Windows OpenSSH、Linux OpenSSH 均能执行命令及完成 SFTP 操作（WSL2 sshd 双平台实测）。
 - [ ] shell 显式支持 `cmd`、`powershell`/`pwsh`、`sh`、`bash`、`zsh`；自动模式不得依据本地 OS 推断远端 OS。
 - [ ] 路径、环境变量、换行和编码由远端适配器处理；SFTP 路径不经本地路径库改写。
-- [ ] IPv4 与 IPv6 主机连接可用；`ssh_scan` 对声明支持的地址族有边界测试。
+- [ ] IPv4 与 IPv6 主机连接可用；连接对声明支持的地址族有边界测试。
 
 ### FR-03 四种审核模式
 

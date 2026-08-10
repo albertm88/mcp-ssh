@@ -33,8 +33,8 @@ print(server.ssh_exec_batch(HOST, [
     "uptime",
 ], timeout=15))
 
-# 扫描网段
-print(server.ssh_scan("192.168.43.0/24", timeout=5.0))
+# 列出已配置主机
+print(server.ssh_list_hosts())
 ```
 
 ### ❌ 错误示范（避免）
@@ -73,20 +73,18 @@ d:/mcp-ssh/.venv/Scripts/python.exe -c "import sys; sys.path.insert(0,'d:/mcp-ss
 
 ### 问题 3：网络环境判断不足
 
-**症状**：`ssh_scan` 默认超时 2s 扫不出主机，反复扫描浪费时间。
+**症状**：网络探测/扫描超时，反复尝试浪费时间。
 
-**根因**：无线网络延迟可达 500ms-2400ms，2s 超时不足。
+**根因**：无线网络延迟可达 500ms-2400ms，短超时不足。
 
 **解决方案**：
-- ✅ 扫描前先用 ping 评估网络延迟
-- ✅ 高延迟网络（>500ms）用 `timeout=5.0` 或更大
-- ✅ /24 网段扫描耗时约 `254 × timeout / max_workers` 秒
+- ✅ 操作前先用 ping 评估网络延迟
+- ✅ 高延迟网络（>500ms）增大命令 `timeout`（如 5.0 或更大）
 
 ```python
-# 先 ping 评估
+# 先 ping 评估，再据此调整操作超时
 server.ssh_exec(HOST, "ping -c 3 192.168.43.1", timeout=10)
-# 再据此调整扫描超时
-server.ssh_scan("192.168.43.0/24", timeout=5.0)  # 高延迟用 5s
+server.ssh_exec(HOST, "uptime", timeout=5.0)  # 高延迟用 5s
 ```
 
 ### 问题 4：grep 全盘搜索效率低
@@ -125,12 +123,14 @@ server.ssh_exec(HOST,
 
 ### 扫描局域网找 SSH 主机
 
-```python
-# 低延迟网络（有线）
-server.ssh_scan("192.168.43.0/24", timeout=1.5)
+> lite 分支已移除 `ssh_scan`。可先用 `ssh_list_hosts` 列出已配置主机；如需网段探测，改用 ping 或本地工具。
 
-# 高延迟网络（无线）— 先 ping 测延迟
-server.ssh_scan("192.168.43.0/24", timeout=5.0)
+```python
+# 列出已配置的主机别名
+print(server.ssh_list_hosts())
+
+# 用 ping 快速判断主机在线（经 ssh_exec 或本地 shell）
+server.ssh_exec(HOST, "ping -c 3 192.168.43.1", timeout=10)
 ```
 
 ### 搜索远程文件
@@ -190,9 +190,7 @@ server.ssh_download(HOST, "/home/ubuntu/remote/log.txt", "C:/local/log.txt")
 | `ssh_exec` | `timeout` | 30 | 简单命令 15s，长命令 60s+ |
 | `ssh_exec` | `shell` | None | 远程是 zsh 时用 `shell="bash"` |
 | `ssh_exec` | `allow_dangerous` | False | 执行 rm/mkfs 时需设 True |
-| `ssh_scan` | `timeout` | 2.0 | 无线网络建议 5.0+ |
-| `ssh_scan` | `max_workers` | 100 | /16 网段建议降到 50 |
-| `ssh_scan` | `detail` | True | 获取 SSH banner 识别设备 |
+| `ssh_filesystem` | `action` | - | `list` / `stat` / `mkdir` / `remove` |
 
 ---
 
@@ -226,4 +224,3 @@ os.environ["SSH_LOG_FLUSH_INTERVAL"] = "2"  # 测试时缩短刷盘间隔
 - `tcp_probe_timeout` — 主机不可达
 - `auth_failed` — 密码错误
 - `ssh_exec_done` — 命令执行完成（含耗时）
-- `ssh_scan_done` — 扫描完成（含发现数量）

@@ -24,15 +24,11 @@ EXPECTED_TOOLS = frozenset({
     "ssh_exec",
     "ssh_exec_batch",
     "ssh_list_hosts",
-    "ssh_scan",
     "ssh_upload",
     "ssh_download",
     "ssh_upload_dir",
     "ssh_download_dir",
-    "ssh_list_dir",
-    "ssh_stat_file",
-    "ssh_mkdir",
-    "ssh_remove",
+    "ssh_filesystem",
     "ssh_get_review_mode",
     "ssh_set_review_mode",
     "ssh_get_audit_logs",
@@ -81,7 +77,7 @@ ENVELOPE_KEYS = frozenset({
 
 
 class TestToolContract:
-    def test_all_14_tools_are_decorated(self) -> None:
+    def test_all_11_tools_are_decorated(self) -> None:
         tool_names = {
             name
             for name in dir(server)
@@ -104,11 +100,11 @@ class TestToolContract:
         assert list(inspect.signature(server.ssh_download).parameters) == [
             "host", "remote_path", "local_path", "timeout", "allow_sensitive",
         ]
-        assert list(inspect.signature(server.ssh_scan).parameters) == [
-            "network", "port", "timeout", "max_workers", "detail",
-        ]
         assert list(inspect.signature(server.ssh_exec_batch).parameters) == [
             "host", "commands", "timeout", "stop_on_error",
+        ]
+        assert list(inspect.signature(server.ssh_filesystem).parameters) == [
+            "host", "action", "remote_path", "parents", "recursive", "show_hidden", "timeout",
         ]
 
     def test_set_review_mode_has_mode_enum(self) -> None:
@@ -247,27 +243,6 @@ class TestHostKeyFailureDetection:
         msg = host_key_mismatch_message("host", 22, RuntimeError("boom"))
         assert "password" not in msg.lower()
         assert "SSH_PASS" not in msg
-
-
-class TestScanLimit:
-    def test_scan_rejects_large_cidr(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # /8 = 16M addresses > 4096，连接前失败关闭（off 模式也不可关闭）
-        monkeypatch.setenv("SSH_REVIEW_MODE", "off")
-        monkeypatch.setattr(server, "_review_engine", FakeEngine())
-
-        result = server.ssh_scan(network="10.0.0.0/8", max_workers=1)
-
-        assert result["status"] == "failed"
-        assert result["error"]["code"] == "RESOURCE_LIMIT"
-        assert result["ok"] is False
-
-    def test_scan_bad_cidr_returns_invalid_argument(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(server, "_review_engine", FakeEngine())
-
-        result = server.ssh_scan(network="not-a-cidr")
-
-        assert result["status"] == "failed"
-        assert result["error"]["code"] == "INVALID_ARGUMENT"
 
 
 class FakeEngine:

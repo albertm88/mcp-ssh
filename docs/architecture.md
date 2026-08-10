@@ -21,7 +21,7 @@ MCP tool
 
 | 组件 | 单一职责 | 禁止事项 |
 |---|---|---|
-| `tools` | 保持 14 个 MCP 工具名/参数，转换请求和响应 | 不直接连接 SSH |
+| `tools` | 保持 11 个 MCP 工具名/参数，转换请求和响应 | 不直接连接 SSH |
 | `plans` | 规范化主机、shell、命令、路径、覆盖/递归范围并生成 digest | 不做授权判断 |
 | `review` | 四模式决策并输出结构化 `ReviewDecision` | 不执行命令/文件操作 |
 | `hosts` | 解析 SSH config、认证来源、host key 策略、远端平台探测 | 不输出凭据 |
@@ -152,14 +152,14 @@ MCP tool
 
 - 新增 `results.py`：`ResultEnvelope`（schema_version/request_id/ok/tool/host/status/duration_ms/review/data/warnings/error/text）。
 - 稳定状态 6 个、稳定错误码 14 个；`retryable` 由错误码集合推导。
-- 14 个 MCP 工具返回 envelope dict（FastMCP 渲染为结构化 JSON 文本，含兼容 `text` 字段）；工具名与输入参数保持兼容。
+- 11 个 MCP 工具返回 envelope dict（FastMCP 渲染为结构化 JSON 文本，含兼容 `text` 字段）；工具名与输入参数保持兼容。
 - 批处理 `stop_on_error` 依据结构化 `data.items[].status` 判断，不再搜索展示文本首行。
 
 ### 10.3 SFTP 可靠原子传输（Review P1 #4）
 
 - `_sftp_put_atomic`：目标同目录临时名 → 流式写入 → 字节数 + SHA-256 校验 → `posix_rename` 原子替换；失败清理临时文件。
 - `_sftp_get_atomic`：本地同目录临时名 → 远端 size 校验 → 原子替换；失败不覆盖已有文件。
-- 目录上传/下载走 `_sftp_bounded_walk`/`_local_bounded_walk`：拒绝软链接逃逸，限制文件数/总字节/递归深度。
+- 目录上传/下载走 `_bounded_walk`（统一 SFTP/本地遍历）：拒绝软链接逃逸，限制文件数/总字节/递归深度。
 - 部分失败返回 `partial` 并列出跳过/失败项，不把部分传输报告为 `succeeded`。
 
 ### 10.4 资源限制（Review P2 #5）
@@ -174,7 +174,7 @@ MCP tool
 
 ### 10.6 行为边界钩子（`_tool_boundary`）
 
-- 所有 14 个 MCP 工具经 `@_tool_boundary` 装饰器包装，统一把未捕获异常映射为稳定错误 envelope（`HOST_KEY_MISMATCH`/`AUTH_FAILED`/`CONNECT_TIMEOUT`/`CONNECTION_LOST`/`RESOURCE_LIMIT`/`CHECKSUM_MISMATCH`/`EXEC_TIMEOUT`/`REMOTE_IO_ERROR`）。
+- 所有 11 个 MCP 工具经 `@_tool_boundary` 装饰器包装，统一把未捕获异常映射为稳定错误 envelope（`HOST_KEY_MISMATCH`/`AUTH_FAILED`/`CONNECT_TIMEOUT`/`CONNECTION_LOST`/`RESOURCE_LIMIT`/`CHECKSUM_MISMATCH`/`EXEC_TIMEOUT`/`REMOTE_IO_ERROR`）。
 - 保证"所有工具 100% 返回 ResultEnvelope"契约——工具内部遗漏的错误分支不会以裸异常逃逸 MCP 边界。
 - 钩子由 `functools.wraps` 保留原签名与 FastMCP schema（MCP `tools/list` 实测 `ssh_exec` 6 参数完整）。
 - 工具内部仍保留业务精确错误映射（exit_code、sha256、batch items 等），钩子作为兜底。

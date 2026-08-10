@@ -6,7 +6,16 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
 
-- **Version**: 1.0.0 (2026-08-09 release)
+> **📦 This document is for the `lite` branch (simplified edition)**
+>
+> | Edition | Branch | Description |
+> |---------|--------|-------------|
+> | **lite (current)** | `lite` | **Simplified**: 11 MCP tools, FS ops merged into `ssh_filesystem`, `ssh_scan` removed |
+> | Full | `main` | 15 MCP tools (incl. `ssh_scan` subnet scan, separate FS tools) |
+>
+> For the full edition, switch to the `main` branch and read its README.
+
+- **Version**: 1.0.0-lite (2026-08-10)
 - **Platforms**: Windows, Linux (incl. WSL2). macOS is **not** supported
 - **Language**: English | [简体中文](README.md)
 
@@ -92,7 +101,7 @@ Expected output (all PASS):
 [1/5] Environment        Python / uv
 [2/5] Dependencies       mcp / paramiko / charset_normalizer
 [3/5] SSH config         config exists, host aliases, known_hosts
-[4/5] MCP protocol       tools/list → 15 tools
+[4/5] MCP protocol       tools/list → 11 tools
 [5/5] Live call          ssh_exec(myserver, hostname) → success
 Result: 12/12 PASS
 ```
@@ -101,14 +110,14 @@ Test in your AI client: **"Use ssh_list_hosts to list configured hosts, then ssh
 
 ---
 
-## Tools (15)
+## Tools (11)
 
 | Category | Tools | Description |
 |----------|-------|-------------|
 | Command | `ssh_exec` / `ssh_exec_batch` | Run single / batch commands |
-| Discovery | `ssh_list_hosts` / `ssh_scan` | List configured hosts / scan subnet |
+| Discovery | `ssh_list_hosts` | List configured hosts |
 | Transfer | `ssh_upload` / `ssh_download` / `ssh_upload_dir` / `ssh_download_dir` | File / dir transfer (atomic + SHA-256) |
-| Remote FS | `ssh_list_dir` / `ssh_stat_file` / `ssh_mkdir` / `ssh_remove` | List / stat / create / delete |
+| Remote FS | `ssh_filesystem` | Unified FS ops: `list` / `stat` / `mkdir` / `remove` (via action) |
 | Review | `ssh_get_review_mode` / `ssh_set_review_mode` | View / switch review mode |
 | Audit | `ssh_get_audit_logs` | Query recent behavior logs (read-only) |
 
@@ -173,7 +182,7 @@ ssh_set_review_mode("smart")      # switch mode
 
 ```
 mcp-ssh/
-├── server.py          # MCP server (15 tools)
+├── server.py          # MCP server (11 tools)
 ├── review.py          # Four-mode review engine
 ├── host_keys.py       # Strict host-key verification
 ├── results.py         # Unified result envelope

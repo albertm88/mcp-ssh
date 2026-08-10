@@ -6,7 +6,16 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/MCP-1.2.0+-purple.svg)](https://modelcontextprotocol.io/)
 
-- **版本**：1.0.0（2026-08-09 正式版）
+> **📦 当前文档为 `lite` 分支（简化版）**
+>
+> | 版本 | 分支 | 说明 |
+> |------|------|------|
+> | **lite（当前）** | `lite` | **简化版**：11 个 MCP 工具，文件类操作合并为 `ssh_filesystem`，移除 `ssh_scan` |
+> | 完整版 | `main` | 15 个 MCP 工具（含 `ssh_scan` 网络扫描、独立文件工具） |
+>
+> 使用完整版请切换到 `main` 分支查看其 README。
+
+- **版本**：1.0.0-lite（2026-08-10）
 - **平台**：Windows、Linux（含 WSL2）。macOS 不支持
 - **语言**：[English](README_EN.md) | 简体中文
 
@@ -92,7 +101,7 @@ uv run python scripts/verify-install.py myserver
 [1/5] 环境检查        Python / uv
 [2/5] 依赖检查        mcp / paramiko / charset_normalizer
 [3/5] SSH 配置检查    config 存在、主机别名、known_hosts
-[4/5] MCP 协议验证    tools/list → 15 个工具
+[4/5] MCP 协议验证    tools/list → 11 个工具
 [5/5] 真实调用验证    ssh_exec(myserver, hostname) → 成功
 结果: 12/12 PASS
 ```
@@ -101,14 +110,14 @@ uv run python scripts/verify-install.py myserver
 
 ---
 
-## 工具一览（15 个）
+## 工具一览（11 个）
 
 | 类别 | 工具 | 说明 |
 |------|------|------|
 | 命令执行 | `ssh_exec` / `ssh_exec_batch` | 单条 / 批量执行命令 |
-| 主机发现 | `ssh_list_hosts` / `ssh_scan` | 列出配置主机 / 扫描网段 |
+| 主机发现 | `ssh_list_hosts` | 列出配置主机 |
 | 文件传输 | `ssh_upload` / `ssh_download` / `ssh_upload_dir` / `ssh_download_dir` | 单文件 / 目录传输（原子写 + SHA-256 校验） |
-| 远端文件 | `ssh_list_dir` / `ssh_stat_file` / `ssh_mkdir` / `ssh_remove` | 目录列表 / 状态 / 创建 / 删除 |
+| 远端文件 | `ssh_filesystem` | 统一文件系统操作：`list` / `stat` / `mkdir` / `remove`（action 区分） |
 | 审核管理 | `ssh_get_review_mode` / `ssh_set_review_mode` | 查看 / 切换审核模式 |
 | 审计查询 | `ssh_get_audit_logs` | 查询最近行为日志（只读） |
 
@@ -173,7 +182,7 @@ ssh_set_review_mode("smart")      # 切换模式
 
 ```
 mcp-ssh/
-├── server.py          # MCP 服务器（15 个工具）
+├── server.py          # MCP 服务器（11 个工具）
 ├── review.py          # 四模式审核引擎
 ├── host_keys.py       # 严格主机密钥校验
 ├── results.py         # 统一结果 envelope
