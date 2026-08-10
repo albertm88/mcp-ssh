@@ -2,6 +2,44 @@
 
 All notable changes are recorded here. The project follows Semantic Versioning.
 
+## [1.0.0-fast] - 2026-08-10（Go 版正式发布，fast 分支）
+
+### Changed
+
+- **全新 Go 实现**：Go 1.26 + mcp-go + x/crypto/ssh，替代 Python 实现。
+  - 启动 ~48ms（含 MCP 握手）vs Python 1749ms（36 倍提升）。
+  - 单二进制 ~10.6MB vs venv 58MB；零环境依赖（拷贝即用）。
+- **工具精简**：11 → 8 个 MCP 工具。
+  - 移除 `ssh_exec_batch`、`ssh_upload_dir`、`ssh_download_dir`。
+  - 保留：`ssh_exec`、`ssh_upload`、`ssh_download`、`ssh_filesystem`、`ssh_list_hosts`、`ssh_get_review_mode`、`ssh_set_review_mode`、`ssh_get_audit_logs`。
+
+### Compatibility
+
+- **envelope 契约 100% 兼容 Python 版**：字段、14 个错误码、6 个状态码、审核绑定一致，客户端无感切换。
+- 4 模式审核（off/whitelist/manual/smart）+ 防御纵深（注入/危险命令全模式生效）。
+- 严格 host key 策略（known_hosts、拒绝未知主机）。
+
+### Security
+
+- 防御纵深：注入/危险命令检测接线到 `review.ValidateCommand`，所有审核模式（含 off）生效。
+- fork bomb 检测支持无空格变体。
+- 敏感路径/遍历守卫覆盖全部文件工具。
+- 审计日志 JSONL 脱敏（`export K=V` 值 → `***`）。
+
+### Fixed（深度测试发现）
+
+- `intParam` 仅支持 float64——int/int64 字面量参数（timeout/limit）静默回退默认值。
+- `LoadKnownHosts` 合并系统 known_hosts 覆盖 `SSH_KNOWN_HOSTS` 显式来源。
+- `sshConfigFor` 匹配后遇后续 Host 块覆盖 entry。
+- Windows `user.Current()` 返回 `DOMAIN\User` 未截取。
+
+### Quality
+
+- 95 个测试跨 5 包；`go test -race` 无竞态；`golangci-lint` 零告警。
+- `govulncheck` 扫描：修复 Go 1.26.4 标准库 TLS 漏洞（升级 1.26.5）。
+- WSL2 真实 E2E：hostname / 超时 / 非零退出 / 上传下载 roundtrip / host key 拒绝。
+- 覆盖率：results 88%、audit 84%、review 69%、server 56%、sshclient 62%。
+
 ## [1.0.0-lite] - 2026-08-10（简化版正式发布，lite 分支）
 
 ### Changed

@@ -15,21 +15,58 @@ import (
 	"github.com/albertm88/mcp-ssh/internal/sshclient"
 )
 
+// sftpOps 是最小 SFTP 操作接口（依赖注入：真实 pkg/sftp 或测试 fake）。
+type sftpOps interface {
+	Stat(path string) (os.FileInfo, error)
+	Create(path string) (io.WriteCloser, error)
+	Open(path string) (io.ReadCloser, error)
+	Rename(oldpath, newpath string) error
+	Remove(path string) error
+	Close() error
+}
+
+// realSFTP 包装 pkg/sftp.Client 实现 sftpOps。
+type realSFTP struct{ c *sftp.Client }
+
+func (r *realSFTP) Stat(path string) (os.FileInfo, error) { return r.c.Stat(path) }
+func (r *realSFTP) Create(path string) (io.WriteCloser, error) {
+	return r.c.Create(path)
+}
+func (r *realSFTP) Open(path string) (io.ReadCloser, error) {
+	return r.c.Open(path)
+}
+func (r *realSFTP) Rename(a, b string) error { return r.c.Rename(a, b) }
+func (r *realSFTP) Remove(path string) error { return r.c.Remove(path) }
+func (r *realSFTP) Close() error             { return r.c.Close() }
+
+// newSFTPClient 从 SSH 连接创建真实 SFTP 实现。
+func newSFTPClient(client *sshclient.Client) (sftpOps, error) {
+	conn, err := client.SSHConn()
+	if err != nil {
+		return nil, err
+	}
+	c, err := sftp.NewClient(conn)
+	if err != nil {
+		return nil, err
+	}
+	return &realSFTP{c: c}, nil
+}
+
 // uploadFile 原子上传：临时名 → 写入 → SHA-256 校验 → 重命名。
 func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrite bool, reviewInfo *results.ReviewInfo) *results.Envelope {
-	conn, err := client.SSHConn()
+	sftpClient, err := newSFTPClient(client)
 	if err != nil {
 		return results.MakeFailure(results.ErrorConnectionLost, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
-	sftpClient, err := sftp.NewClient(conn)
-	if err != nil {
-		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
-	}
 	defer sftpClient.Close()
+	return uploadViaSFTP(sftpClient, localPath, remotePath, overwrite, reviewInfo)
+}
 
+// uploadViaSFTP 用注入的 SFTP 实现执行上传（可单测）。
+func uploadViaSFTP(s sftpOps, localPath, remotePath string, overwrite bool, reviewInfo *results.ReviewInfo) *results.Envelope {
 	// 存在性检查
 	if !overwrite {
-		if _, err := sftpClient.Stat(remotePath); err == nil {
+		if _, err := s.Stat(remotePath); err == nil {
 			return results.MakeFailure(results.ErrorInvalidArgument,
 				fmt.Sprintf("远端目标已存在：%s（overwrite=False）", remotePath), "ssh_upload", "", "", nil, reviewInfo)
 		}
@@ -42,21 +79,21 @@ func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrit
 	}
 	defer src.Close()
 
-	dst, err := sftpClient.Create(tmp)
+	dst, err := s.Create(tmp)
 	if err != nil {
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	written, copyErr := io.Copy(dst, src)
 	dst.Close()
 	if copyErr != nil {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, copyErr.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 
 	// 字节数校验
 	localStat, err := srcStat(localPath)
 	if err == nil && written != localStat {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorChecksumMismatch,
 			fmt.Sprintf("字节数不一致：local=%d remote=%d", localStat, written), "ssh_upload", "", "", nil, reviewInfo)
 	}
@@ -64,29 +101,29 @@ func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrit
 	// SHA-256 校验
 	localDigest, err := sshclient.Sha256File(localPath)
 	if err != nil {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorLocalIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
-	remoteFile, err := sftpClient.Open(tmp)
+	remoteFile, err := s.Open(tmp)
 	if err != nil {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	remoteData, readErr := io.ReadAll(remoteFile)
 	remoteFile.Close()
 	if readErr != nil {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, readErr.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 	remoteDigest := sshclient.Sha256Bytes(remoteData)
 	if localDigest != remoteDigest {
-		cleanupRemove(sftpClient, tmp)
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorChecksumMismatch, "SHA-256 校验不一致", "ssh_upload", "", "", nil, reviewInfo)
 	}
 
 	// 原子重命名
-	if err := sftpClient.Rename(tmp, remotePath); err != nil {
-		cleanupRemove(sftpClient, tmp)
+	if err := s.Rename(tmp, remotePath); err != nil {
+		cleanupRemove(s, tmp)
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_upload", "", "", nil, reviewInfo)
 	}
 
@@ -102,24 +139,24 @@ func uploadFile(client *sshclient.Client, localPath, remotePath string, overwrit
 
 // downloadFile 原子下载：临时名 → 字节校验 → 原子替换。
 func downloadFile(client *sshclient.Client, remotePath, localPath string, reviewInfo *results.ReviewInfo) *results.Envelope {
-	conn, err := client.SSHConn()
+	sftpClient, err := newSFTPClient(client)
 	if err != nil {
 		return results.MakeFailure(results.ErrorConnectionLost, err.Error(), "ssh_download", "", "", nil, reviewInfo)
 	}
-	sftpClient, err := sftp.NewClient(conn)
-	if err != nil {
-		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_download", "", "", nil, reviewInfo)
-	}
 	defer sftpClient.Close()
+	return downloadViaSFTP(sftpClient, remotePath, localPath, reviewInfo)
+}
 
-	remoteStat, err := sftpClient.Stat(remotePath)
+// downloadViaSFTP 用注入的 SFTP 实现执行下载（可单测）。
+func downloadViaSFTP(s sftpOps, remotePath, localPath string, reviewInfo *results.ReviewInfo) *results.Envelope {
+	remoteStat, err := s.Stat(remotePath)
 	if err != nil {
 		return results.MakeFailure(results.ErrorRemoteIOError, "远端文件不存在："+remotePath, "ssh_download", "", "", nil, reviewInfo)
 	}
 
 	// 本地临时名
 	tmp := localTmpName(localPath)
-	remoteFile, err := sftpClient.Open(remotePath)
+	remoteFile, err := s.Open(remotePath)
 	if err != nil {
 		return results.MakeFailure(results.ErrorRemoteIOError, err.Error(), "ssh_download", "", "", nil, reviewInfo)
 	}
@@ -279,7 +316,7 @@ func srcStat(path string) (int64, error) {
 }
 
 // cleanupRemove 尽力清理临时远端文件（失败不阻断主流程）。
-func cleanupRemove(s *sftp.Client, remote string) {
+func cleanupRemove(s sftpOps, remote string) {
 	_ = s.Remove(remote)
 }
 

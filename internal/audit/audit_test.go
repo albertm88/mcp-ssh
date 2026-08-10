@@ -1,9 +1,11 @@
 package audit
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestRedactArgs(t *testing.T) {
@@ -73,6 +75,59 @@ func TestQueryMissingFile(t *testing.T) {
 	_, _, err := Query(QueryOptions{})
 	if err == nil {
 		t.Error("missing file should error")
+	}
+}
+
+func TestQuerySinceMinutes(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SSH_LOG_FILE", filepath.Join(dir, "a.jsonl"))
+	// 直接写入一条旧时间戳记录 + 一条新记录
+	old := Record{Timestamp: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339), Host: "h", Tool: "ssh_exec"}
+	newRec := Record{Timestamp: time.Now().UTC().Format(time.RFC3339), Host: "h", Tool: "ssh_upload"}
+	line1, _ := json.Marshal(old)
+	line2, _ := json.Marshal(newRec)
+	if err := os.WriteFile(filepath.Join(dir, "a.jsonl"), append(append(line1, '\n'), append(line2, '\n')...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, total, err := Query(QueryOptions{SinceMinute: 60, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || recs[0].Tool != "ssh_upload" {
+		t.Errorf("since filter: recs=%+v total=%d", recs, total)
+	}
+}
+
+func TestQuerySkipsCorruptLines(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.jsonl")
+	t.Setenv("SSH_LOG_FILE", p)
+	content := "not-json\n{\"tool\":\"ssh_exec\",\"host\":\"h\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recs, total, err := Query(QueryOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(recs) != 1 {
+		t.Errorf("corrupt lines should be skipped: recs=%+v total=%d", recs, total)
+	}
+}
+
+func TestQueryLimitCapsAt500(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SSH_LOG_FILE", filepath.Join(dir, "a.jsonl"))
+	for i := 0; i < 10; i++ {
+		if err := Append(Record{Host: "h", Tool: "ssh_exec"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// limit=0 → 默认 50；limit 超过 500 会被钳制
+	recs, _, _ := Query(QueryOptions{Limit: 0})
+	if len(recs) != 10 {
+		t.Errorf("default limit: len=%d", len(recs))
 	}
 }
 
