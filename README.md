@@ -12,12 +12,44 @@
 > |------|------|------|
 > | **lite（当前）** | `lite` | **简化版**：11 个 MCP 工具，文件类操作合并为 `ssh_filesystem`，移除 `ssh_scan` |
 > | 完整版 | `main` | 15 个 MCP 工具（含 `ssh_scan` 网络扫描、独立文件工具） |
->
-> 使用完整版请切换到 `main` 分支查看其 README。
+> | 极速版 | `fast` | Go 1.26 实现，8 个 MCP 工具，单二进制 ~10MB、启动 ~48ms、零环境依赖 |
 
 - **版本**：1.0.0-lite（2026-08-10）
 - **平台**：Windows、Linux（含 WSL2）。macOS 不支持
 - **语言**：[English](README_EN.md) | 简体中文
+
+---
+
+## 版本家族（一主二分支）
+
+本项目维护三个并行版本，共用同一套 envelope 契约、4 模式审核与防御纵深，客户端可无感切换：
+
+| 版本 | 分支 | 实现 | 工具数 | 定位 | 适用场景 |
+|------|------|------|:---:|------|---------|
+| **完整版** | `main` | Python + Paramiko | 15 | 功能最全 | 需要网络扫描、批量命令、目录传输 |
+| **简化版** | `lite`（本分支） | Python + Paramiko | 11 | 功能裁剪 | 文件操作合并、无需扫描 |
+| **极速版** | `fast` | Go 1.26 | 8 | 性能优先 | 单二进制、毫秒启动、零依赖 |
+
+### 功能差异对比
+
+| 能力 | main | lite | fast |
+|------|:---:|:---:|:---:|
+| `ssh_exec` 命令执行 | ✅ | ✅ | ✅ |
+| `ssh_upload` / `ssh_download` | ✅ | ✅ | ✅ |
+| `ssh_filesystem`（list/stat/mkdir/remove） | ❌ 4 个独立工具 | ✅ 合并 | ✅ 合并 |
+| `ssh_scan`（网络扫描） | ✅ | ❌ | ❌ |
+| `ssh_exec_batch`（批量命令） | ✅ | ✅ | ❌ |
+| `ssh_upload_dir` / `ssh_download_dir`（目录传输） | ✅ | ✅ | ❌ |
+| `ssh_list_hosts` | ✅ | ✅ | ✅ |
+| 审核模式（off/whitelist/manual/smart） | ✅ | ✅ | ✅ |
+| 防御纵深（注入/危险命令拦截） | ✅ | ✅ | ✅ |
+| 严格 host key 策略 | ✅ | ✅ | ✅ |
+| envelope 契约兼容 | ✅ | ✅ | ✅ |
+| 启动延迟（含握手） | ~1749ms | ~1749ms | **~48ms** |
+| 部署体积 | venv 58MB | venv 58MB | **单二进制 10.6MB** |
+| 环境依赖 | Python + uv/venv | Python + uv/venv | **零** |
+
+> 选择建议：日常管理服务器选 **main**；追求简洁选 **lite**；对启动速度和部署体积敏感（如 CI、无 Python 环境）选 **fast**。
 
 ---
 
