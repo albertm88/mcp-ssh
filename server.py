@@ -71,7 +71,7 @@ _DEFAULT_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa")
 
 # 危险命令拦截列表（防止误操作）
 _DANGEROUS_COMMANDS = re.compile(
-    r"^\s*(rm\s+(-rf?|--recursive)\s+/(?!tmp|var/tmp)|mkfs|dd\s+if=|format\s+[a-z]:|shutdown|reboot|halt|poweroff|:(){ :|:& };:|fork\s*bomb)",
+    r"^\s*(rm\s+(-rf?|--recursive)\s+/(?!tmp|var/tmp)|mkfs|dd\s+if=|format\s+[a-z]:|shutdown|reboot|halt|poweroff|:\(\)\s*\{.*\};:|fork\s*bomb)",
     re.IGNORECASE,
 )
 # 命令注入特征检测（排除合法的 && || 管道操作，只检测恶意特征）
@@ -490,13 +490,26 @@ def _validate_command(
     environment: Optional[dict[str, str]] = None,
     ctx: Any = None,
 ) -> tuple[ReviewContext, ReviewResult]:
-    """命令安全校验：委托审核引擎进行多模式审核。"""
+    """命令安全校验：委托审核引擎进行多模式审核。
+
+    防御纵深（defense-in-depth）：即使审核模式为 off，
+    命令注入特征与危险命令拦截仍然生效（与资源限制同级，不可绕过）；
+    危险命令在 `allow_dangerous=True` 时豁免，注入特征无豁免。
+    """
     if not command.strip():
         raise ValueError("命令不能为空")
 
     if len(command) > 10000:
         _log.warning("command_too_long", length=len(command))
         raise RuntimeError("命令长度超过限制（最大10000字符）")
+
+    if not allow_dangerous and _DANGEROUS_COMMANDS.search(command):
+        _log.warning("dangerous_command_blocked", command=command[:200])
+        raise RuntimeError("命令命中危险命令拦截列表，如需执行请设置 allow_dangerous=True")
+
+    if _INJECTION_PATTERNS.search(command):
+        _log.warning("command_injection_blocked", command=command[:200])
+        raise RuntimeError("命令命中注入特征检测，已拒绝执行")
 
     _, environment_names, environment_digest = build_environment_plan(environment)
     ctx_obj = ReviewContext(
