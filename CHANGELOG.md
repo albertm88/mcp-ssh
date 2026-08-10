@@ -2,6 +2,24 @@
 
 All notable changes are recorded here. The project follows Semantic Versioning.
 
+## [1.0.1] - 2026-08-10（质量与安全加固）
+
+### Security
+
+- **防御纵深（defense-in-depth）**：`_DANGEROUS_COMMANDS`/`_INJECTION_PATTERNS` 从死代码接线到 `_validate_command`——命令注入特征检测与危险命令拦截在**所有审核模式（含 off）**生效，不可绕过；危险命令仅在 `allow_dangerous=True` 时豁免，注入特征无豁免。
+- **fork bomb 检测加固**：`_DANGEROUS_COMMANDS` 正则修复，可匹配 `:(){:|:&};:` 等无空格变体（此前仅匹配带空格形式）。
+
+### Fixed
+
+- **空路径失败关闭**：`ssh_list_dir`/`ssh_stat_file`/`ssh_mkdir`/`ssh_remove` 空/空白 `remote_path` 返回 `INVALID_ARGUMENT`，不再尝试连接或执行 `ls ''` 等命令。
+- **`ssh_list_dir` 解析修复**：条目 name 从 `HH:MM` 时间列后正确提取（历史错位导致 `.`/`..` 过滤失效），并剥离行尾 `\r`（CRLF 残留）。
+- **mypy 零错误基线**：修复 8 个类型错误（`Optional` 默认值、缺失 `host` 参数、重复 `main()` 定义）。
+
+### Quality
+
+- 新增离线回归测试：`tests/test_fs_guards.py`（10 用例，空路径守卫与 list 解析）、`tests/test_command_structure.py`（64 用例，POSIX shell 包装/注入正则/输入边界/环境计划/batch 结构）。
+- 测试总数 122 → 196；WSL2 真实 E2E 全绿（hostname/SFTP roundtrip/超时/防御纵深故障注入）。
+
 ## [Unreleased] - 2026-08-09（候选变更）
 
 ### Added
