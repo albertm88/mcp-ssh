@@ -112,7 +112,7 @@ class ReviewMode(Enum):
     SMART = "smart"
 
     @classmethod
-    def from_env(cls, key: str = "SSH_REVIEW_MODE", default: "ReviewMode" = None) -> "ReviewMode":
+    def from_env(cls, key: str = "SSH_REVIEW_MODE", default: "ReviewMode | None" = None) -> "ReviewMode":
         if default is None:
             default = cls.WHITELIST
         name = os.getenv(key, "").lower().strip()

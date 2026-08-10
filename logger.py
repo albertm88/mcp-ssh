@@ -32,7 +32,7 @@ class Level(IntEnum):
     ERROR = 40
 
     @classmethod
-    def from_env(cls, key: str = "SSH_LOG_LEVEL", default: "Level" = None) -> "Level":
+    def from_env(cls, key: str = "SSH_LOG_LEVEL", default: "Level | None" = None) -> "Level":
         if default is None:
             default = cls.INFO
         name = os.getenv(key, "").upper()
@@ -120,7 +120,9 @@ class BufferedLogger:
         }
         with self._lock:
             # If buffer is full, force-flush before appending
-            if len(self._buffer) >= self._buffer.maxlen:  # type: ignore[arg-type]
+            maxlen = self._buffer.maxlen
+            assert maxlen is not None
+            if len(self._buffer) >= maxlen:
                 entries = list(self._buffer)
                 self._buffer.clear()
                 self._write_entries(entries)

@@ -979,7 +979,7 @@ def ssh_list_hosts() -> dict:
     _log.info("ssh_list_hosts_done", count=len(hosts))
     if not hosts:
         return make_success(
-            tool="ssh_list_hosts",
+            tool="ssh_list_hosts", host="",
             data={"hosts": []},
             text="~/.ssh/config 中没有配置 Host 别名。",
         ).to_dict()
@@ -997,7 +997,7 @@ def ssh_list_hosts() -> dict:
         output.append("  " + " ".join(info))
         entries.append(entry)
     env = make_success(
-        tool="ssh_list_hosts",
+        tool="ssh_list_hosts", host="",
         data={"hosts": entries},
         text="\n".join(output),
     )
@@ -1099,7 +1099,7 @@ def ssh_scan(
     if not results:
         text = f"网段 {network} 中未发现开放端口 {port} 的主机（耗时 {round(elapsed, 1)}s）。"
         return make_success(
-            tool="ssh_scan",
+            tool="ssh_scan", host="",
             data={"network": network, "port": port, "found": 0, "hosts": []},
             text=text,
             review=_review_summary(review_result),
@@ -1116,7 +1116,7 @@ def ssh_scan(
     output.append("-" * 70)
     output.append(f"💡 可使用 ssh_exec 在这些主机上执行命令（如 ssh_exec('user@IP', 'hostname')）")
     env = make_success(
-        tool="ssh_scan",
+        tool="ssh_scan", host="",
         data={
             "network": network,
             "port": port,
@@ -1469,6 +1469,11 @@ def ssh_exec_batch(host: str, commands: list[str], timeout: int = 30, stop_on_er
 @_tool_boundary("ssh_list_dir")
 def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, timeout: int = 10) -> dict:
     """列出远程主机指定目录下的文件和子目录。"""
+    if not remote_path.strip():
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "remote_path 不能为空",
+            tool="ssh_list_dir", host=host,
+        ).to_dict()
     if not show_hidden and _SENSITIVE_PATHS.search(remote_path):
         _log.warning("list_sensitive_dir", path=remote_path)
         return make_failure(
@@ -1504,6 +1509,7 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
     entries: list[dict] = []
 
     for line in lines:
+        line = line.rstrip("\r\n")
         if not line.strip():
             continue
         parts = line.split(maxsplit=6)
@@ -1511,8 +1517,10 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
             continue
         perm = parts[0]
         size = parts[4]
-        mtime = f"{parts[5]} {parts[6].split()[0]}"
-        name = parts[6] if len(parts) > 6 else ""
+        tail = parts[6] if len(parts) > 6 else ""
+        tail_parts = tail.split(maxsplit=1)
+        mtime = f"{parts[5]} {tail_parts[0]}" if tail_parts else parts[5]
+        name = tail_parts[1] if len(tail_parts) > 1 else ""
         if name in (".", ".."):
             continue
         if not show_hidden and name.startswith("."):
@@ -1551,6 +1559,11 @@ def ssh_list_dir(host: str, remote_path: str = "~", show_hidden: bool = False, t
 @_tool_boundary("ssh_stat_file")
 def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> dict:
     """获取远程文件或目录的详细信息。"""
+    if not remote_path.strip():
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "remote_path 不能为空",
+            tool="ssh_stat_file", host=host,
+        ).to_dict()
     result = ssh_exec(host, f"stat {shlex.quote(remote_path)}", timeout=timeout)
     if result.get("status") != STATUS_SUCCEEDED:
         err = result.get("error") or {}
@@ -1572,6 +1585,11 @@ def ssh_stat_file(host: str, remote_path: str, timeout: int = 10) -> dict:
 @_tool_boundary("ssh_mkdir")
 def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 10) -> dict:
     """在远程主机创建目录。"""
+    if not remote_path.strip():
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "remote_path 不能为空",
+            tool="ssh_mkdir", host=host,
+        ).to_dict()
     if _SENSITIVE_PATHS.search(remote_path):
         _log.warning("mkdir_sensitive_path", path=remote_path)
         return make_failure(
@@ -1619,6 +1637,11 @@ def ssh_mkdir(host: str, remote_path: str, parents: bool = True, timeout: int = 
 @_tool_boundary("ssh_remove")
 def ssh_remove(host: str, remote_path: str, recursive: bool = False, timeout: int = 30) -> dict:
     """删除远程主机上的文件或目录。"""
+    if not remote_path.strip():
+        return make_failure(
+            ERROR_INVALID_ARGUMENT, "remote_path 不能为空",
+            tool="ssh_remove", host=host,
+        ).to_dict()
     ctx = ReviewContext(
         tool="ssh_remove",
         command=f"remove {remote_path} (recursive={recursive})",
@@ -2202,10 +2225,6 @@ def _render_log_query_text(records: list[dict], total: int) -> str:
         args = json.dumps(r.get("args") or {}, ensure_ascii=False)[:120]
         lines.append(f"[{ts}] {user}@{host} {tool} → {status} args={args}")
     return "\n".join(lines)
-
-
-def main() -> None:
-    mcp.run()
 
 
 def main() -> None:
